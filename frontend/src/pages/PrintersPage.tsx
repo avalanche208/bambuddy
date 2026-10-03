@@ -170,6 +170,7 @@ import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { BulkPrinterToolbar, type PrinterState } from '../components/BulkPrinterToolbar';
 import { FileManagerModal } from '../components/FileManagerModal';
+import { PrinterCardPreview } from '../components/PrinterCardPreview';
 import { EmbeddedCameraViewer } from '../components/EmbeddedCameraViewer';
 import { CameraWall } from '../components/CameraWall';
 import { ContextMenu, type ContextMenuItem } from '../components/ContextMenu';
@@ -4423,12 +4424,12 @@ function PrinterCard({
                         )}
                       </button>
                       <div className="flex items-stretch gap-2">
-                        <CoverImage
-                          url={coverUrl}
-                          printName={printName || undefined}
-                          className="w-24 h-24 max-[520px]:w-20 max-[520px]:h-20"
-                        />
-                        <div className="flex h-24 max-[520px]:h-20 min-w-0 flex-1 flex-col justify-between pt-1">
+                        <PrinterCardPreview printerId={printer.id} printerName={printer.name}
+                          connected={status.connected} canViewCamera={hasPermission('camera:view')}
+                          cameraRotation={printer.camera_rotation}>
+                          <CoverImage url={coverUrl} printName={printName || undefined} className="w-full h-full" />
+                        </PrinterCardPreview>
+                        <div className="flex min-h-[7.2rem] max-[520px]:min-h-24 min-w-0 flex-1 flex-col justify-between gap-1 pt-1">
                           <div className="flex min-h-[18px] items-center gap-2 pr-8">
                             <p className="min-w-0 truncate text-sm text-bambu-gray">{getStatusDisplay(status.state, status.stg_cur_name)}</p>
                             {plateStatusPill}
@@ -4445,7 +4446,7 @@ function PrinterCard({
                             </div>
                             <span className={`w-9 shrink-0 pr-1 text-right text-[length:var(--pc-t11,11px)] leading-none ${isActivePrint || showRetainedPrint ? 'text-white' : 'text-bambu-gray'}`}>{isActivePrint || showRetainedPrint ? `${Math.round(progress)}%` : '---%'}</span>
                           </div>
-                          <div className="flex min-h-[16px] items-center gap-2 text-xs text-bambu-gray">
+                          <div className="flex min-h-[16px] flex-wrap items-center gap-x-2 gap-y-1 text-xs text-bambu-gray">
                             {isActivePrint ? (
                               <>
                                 {status.remaining_time != null && status.remaining_time > 0 && (

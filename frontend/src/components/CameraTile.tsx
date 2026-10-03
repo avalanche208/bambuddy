@@ -8,6 +8,7 @@ export type CameraTileMode = 'live' | 'snapshot' | 'paused';
 export type CameraTileStatusMode = 'off' | 'compact' | 'full';
 
 interface CameraTileProps {
+  compact?: boolean;
   printerId: number;
   printerName: string;
   cameraRotation?: number;
@@ -60,6 +61,7 @@ const BUCKET_CHIP_CLASS: Record<StatusBucket, string> = {
 export function CameraTile({
   printerId,
   printerName,
+  compact = false,
   cameraRotation = 0,
   mode,
   snapshotIntervalMs,
@@ -147,7 +149,7 @@ export function CameraTile({
   const hasLayers = layerNum != null && totalLayers != null && totalLayers > 0;
   const hasRemaining = remainingMin != null && remainingMin > 0;
 
-  const rootClass = `group relative aspect-video w-full overflow-hidden rounded-lg border border-bambu-dark-tertiary bg-black text-left ${
+  const rootClass = `group relative ${compact ? 'h-full' : 'aspect-video'} w-full overflow-hidden rounded-lg border border-bambu-dark-tertiary bg-black text-left ${
     interactive ? 'focus:outline-none focus:ring-2 focus:ring-bambu-green' : 'cursor-default'
   }`;
 
@@ -212,7 +214,7 @@ export function CameraTile({
       </span>
 
       {/* Bottom overlay: name + (when full) print info */}
-      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/55 to-transparent px-2 pb-1.5 pt-3 text-white">
+      <div hidden={compact} className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/55 to-transparent px-2 pb-1.5 pt-3 text-white">
         {showInfoStrip && (
           <div className="mb-0.5 space-y-0.5 text-[11px] leading-tight text-white/90">
             {fileLabel && (

@@ -936,3 +936,18 @@ class TestUpdatesAPI:
             body = (await async_client.get("/api/v1/updates/check")).json()
         assert body["update_method"] == "git"
         assert body["compose_dir_detected"] is None
+
+
+class TestForkVersions:
+    def test_fork_builds_are_stable_and_ordered(self):
+        from backend.app.api.routes.updates import parse_version, is_newer_version, GITHUB_REPO
+        assert GITHUB_REPO == "avalanche208/bambuddy"
+        older = "1.2.5.7-fork.2026.10.3.1g"
+        newer = "1.2.5.7-fork.2026.10.3.1h"
+        assert parse_version(newer)[4] == 0
+        assert is_newer_version(newer, older)
+        assert not is_newer_version(older, newer)
+        assert not is_newer_version(newer, newer)
+        assert is_newer_version("1.2.5.7-fork.2026.10.4.1a", newer)
+        assert is_newer_version("1.2.5.8-fork.2026.10.3.1a", newer)
+        assert not is_newer_version("1.2.5.6-fork.2027.1.1.1a", newer)

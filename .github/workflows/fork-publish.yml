@@ -1,7 +1,7 @@
 name: Build original Bambuddy fork
 on:
   push:
-    branches: [main, restore-original]
+    branches: [main, restore-original, preview-camera-update]
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,7 +20,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: frontend
-      - run: npx vitest run src/__tests__/components/Layout.test.tsx
+      - run: npx vitest run src/__tests__/components/Layout.test.tsx src/__tests__/components/CameraTile.test.tsx src/__tests__/components/PrinterCardPreview.test.tsx
         working-directory: frontend
       - uses: actions/setup-python@v5
         with:
@@ -29,9 +29,14 @@ jobs:
       - name: Verify MQTT parsing and disabled automatic probe
         run: PYTHONPATH=. python -m pytest -c /dev/null --noconftest backend/tests/unit/services/test_bambu_mqtt.py -q
       - run: docker build -t bambuddy:restore-test .
+      - name: Verify fork update source and version ordering in image
+        run: |
+          docker run --rm --entrypoint python bambuddy:restore-test -c 'from backend.app.api.routes.updates import GITHUB_REPO, parse_version, is_newer_version; assert GITHUB_REPO == "avalanche208/bambuddy"; assert parse_version("1.2.5.7-fork.2026.10.3.1h")[4] == 0; assert is_newer_version("1.2.5.7-fork.2026.10.3.1h", "1.2.5.7-fork.2026.10.3.1g"); assert not is_newer_version("1.2.5.7-fork.2026.10.3.1g", "1.2.5.7-fork.2026.10.3.1h")'
   publish:
     if: github.ref == 'refs/heads/main'
     needs: validate
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,3 +66,11 @@ jobs:
             avalanche208/bambuddy:${{ steps.version.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Publish fork release after Docker push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ steps.version.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Bambuddy $RELEASE_TAG" --notes-file FORK-RELEASE.md --latest
+          fi

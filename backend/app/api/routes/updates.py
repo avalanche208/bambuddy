@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
-from backend.app.core.config import APP_VERSION, GITHUB_REPO, settings
+from backend.app.core.config import APP_VERSION, UPDATE_GITHUB_REPO as GITHUB_REPO, settings
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.settings import Settings
@@ -356,7 +356,7 @@ def parse_version(version: str) -> tuple:
         "0.1.8.1"  -> (0, 1, 8, 1, 0, 0)   # patch release
     """
     # Remove 'v' prefix if present
-    version = version.lstrip("v")
+    version = version.lstrip("v").split("-fork.", 1)[0]
 
     # Strip daily build suffix (e.g., "0.2.2b4-daily.20260313" -> "0.2.2b4")
     version = re.sub(r"-daily\.\d+$", "", version)
@@ -427,7 +427,16 @@ def is_newer_version(latest: str, current: str) -> bool:
         latest_prerelease_num = latest_parsed[5] if len(latest_parsed) > 5 else 0
         current_prerelease_num = current_parsed[5] if len(current_parsed) > 5 else 0
 
-        return latest_prerelease_num > current_prerelease_num
+        if latest_prerelease_num != current_prerelease_num:
+            return latest_prerelease_num > current_prerelease_num
+
+        # Fork builds share an upstream version; compare their date/revision too.
+        def fork_revision(value: str) -> tuple:
+            suffix = value.partition("-fork.")[2]
+            match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)\.(\d+)([a-z]*)", suffix)
+            return (*map(int, match.groups()[:4]), match.group(5)) if match else (0, 0, 0, 0, "")
+
+        return fork_revision(latest) > fork_revision(current)
 
     except Exception:
         return False
