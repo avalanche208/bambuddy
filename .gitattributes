@@ -1,3 +1,0 @@
-# Force CRLF line endings for Windows batch files so cmd.exe can parse them
-# regardless of the user's core.autocrlf setting.
-*.bat text eol=crlf

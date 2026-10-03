@@ -1057,7 +1057,7 @@ async def test_camera_connection(
                 "success": False,
                 "error": (
                     "Failed to capture frame from camera. "
-                    "Ensure the printer is powered on, camera is enabled, and Developer Mode is active. "
+                    "Ensure the printer is powered on and local camera access is enabled. "
                     "If running in Docker, try 'network_mode: host' in docker-compose.yml."
                 ),
             }
