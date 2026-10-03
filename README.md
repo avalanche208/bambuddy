@@ -1,6 +1,6 @@
 # Bambuddy Monitor
 
-A monitoring-only fork of [maziggy/bambuddy](https://github.com/maziggy/bambuddy), for printer status and filament inventory. Version **2026.10.3-1c**.
+A monitoring-only fork of [maziggy/bambuddy](https://github.com/maziggy/bambuddy), for printer status and filament inventory. Version **2026.10.3-1d**.
 
 **Developer Mode is not required.** Printers can stay connected to Bambu Cloud while this application reads their local MQTT telemetry. Network and firmware must permit local status access. Nothing in this app starts, pauses, stops, moves, heats, loads, unloads, configures or updates a printer.
 
@@ -43,7 +43,7 @@ To build locally instead, run `docker compose up -d --build`.
 
 Open `http://SERVER-IP:8000`; sign in as `admin` with the password from `.env`. Add each printer using its local IP, serial number and access code. No Bambu account password is requested.
 
-For unRAID: use `avalanche208/bambuddy:latest`, map container port 8000, keep your existing `/app/data` and `/app/logs` mappings (data must be writable by UID 1000), and set `BAMBUDDY_PASSWORD`. Change `BAMBUDDY_USERNAME` if desired. The host must reach each printer on TCP 8883; cameras additionally use 322 or 6000. Manual IP setup works with bridge networking; host networking and printer discovery are not required. After validation, pushes to `main` publish `latest` and the application version tag to Docker Hub for amd64 and arm64. This uses the repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` (a Docker Hub access token).
+For unRAID: use `avalanche208/bambuddy:latest`, map container port 8000, keep your existing `/app/data` and `/app/logs` mappings (ownership is set using PUID/PGID, default 1000:1000), and set `BAMBUDDY_PASSWORD`. Change `BAMBUDDY_USERNAME` if desired. The host must reach each printer on TCP 8883; cameras additionally use 322 or 6000. Manual IP setup works with bridge networking; host networking and printer discovery are not required. After validation, pushes to `main` publish `latest` and the application version tag to Docker Hub for amd64 and arm64. This uses the repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` (a Docker Hub access token).
 
 For access beyond a trusted LAN, use your HTTPS reverse proxy. HTTP Basic authentication requires HTTPS to protect the browser-to-server credentials. When using a proxy, preserve the original Host and scheme and configure Uvicorn's trusted proxy IPs appropriately. Printer TLS behavior is inherited from upstream and accepts the printers' self-signed certificates.
 

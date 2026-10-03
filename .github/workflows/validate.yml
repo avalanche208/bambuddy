@@ -16,6 +16,22 @@ jobs:
       - run: python -m pytest -q
       - run: node --check monitor/static/app.js
       - run: docker build -t bambuddy-monitor:test .
+      - name: Verify startup with mounted folders and custom UID
+        run: |
+          mkdir -p "$RUNNER_TEMP/bambuddy-data" "$RUNNER_TEMP/bambuddy-logs"
+          docker run -d --name monitor-smoke -p 127.0.0.1:18000:8000 \
+            -e BAMBUDDY_PASSWORD=ci-smoke-only -e PUID=1234 -e PGID=1234 \
+            -v "$RUNNER_TEMP/bambuddy-data:/app/data" \
+            -v "$RUNNER_TEMP/bambuddy-logs:/app/logs" bambuddy-monitor:test
+          trap 'docker logs monitor-smoke; docker rm -f monitor-smoke' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18000/health; then
+              test "$(stat -c %u "$RUNNER_TEMP/bambuddy-data/monitor.db")" = 1234
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test
