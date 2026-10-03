@@ -4429,7 +4429,7 @@ function PrinterCard({
                           cameraRotation={printer.camera_rotation}>
                           <CoverImage url={coverUrl} printName={printName || undefined} className="w-full h-full" />
                         </PrinterCardPreview>
-                        <div className="flex min-h-[7.2rem] max-[520px]:min-h-24 min-w-0 flex-1 flex-col justify-between gap-1 pt-1">
+                        <div className="flex min-h-36 max-[520px]:min-h-[7.2rem] min-w-0 flex-1 flex-col justify-between gap-1 pt-1">
                           <div className="flex min-h-[18px] items-center gap-2 pr-8">
                             <p className="min-w-0 truncate text-sm text-bambu-gray">{getStatusDisplay(status.state, status.stg_cur_name)}</p>
                             {plateStatusPill}

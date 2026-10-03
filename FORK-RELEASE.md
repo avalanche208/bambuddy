@@ -1,6 +1,6 @@
-Original Bambuddy with the automatic Developer Mode command probe disabled and its persistent warning banner removed.
+Increase inline preview to 9rem on desktop and 7.2rem on mobile, with matching responsive status details.
 
-This update points in-app update checks at avalanche208/bambuddy, adds a per-printer preview/live-webcam toggle, and enlarges the preview area by 20% with responsive status details.
+Remove automatic K-profile priming on connection. Startup now requests only full status and firmware version; automatic Developer Mode setting probes remain disabled. Real HMS errors remain visible. A verification fault already retained by the printer can still be reported after reconnecting; this update does not clear printer faults.
 
-Docker: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1h (also latest).
-Rollback without these UI/update-check changes: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1g. Keep existing volume mappings. No database schema changes.
+Image: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1i (also latest).
+Previous version: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1h. No database or volume-path changes.

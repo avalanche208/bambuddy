@@ -23,7 +23,7 @@ export function PrinterCardPreview({ printerId, printerName, connected, canViewC
     try { localStorage.setItem(key, String(next)); } catch { /* Session-only if storage is blocked. */ }
   };
   return (
-    <div className="relative w-[7.2rem] h-[7.2rem] max-[520px]:w-24 max-[520px]:h-24 shrink-0 overflow-hidden rounded-lg">
+    <div className="relative w-36 h-36 max-[520px]:w-[7.2rem] max-[520px]:h-[7.2rem] shrink-0 overflow-hidden rounded-lg">
       {showLive ? (
         <CameraTile printerId={printerId} printerName={printerName} connected={connected}
           cameraRotation={cameraRotation} mode="live" snapshotIntervalMs={5000} compact />

@@ -1789,8 +1789,9 @@ class BambuMQTTClient:
             self._request_version()
             # Note: get_accessories returns stale nozzle data on H2D, so we don't use it.
             # The correct nozzle data comes from push_status.
-            # Prime K-profile request (Bambu printers often ignore first request)
-            self._prime_kprofile_request()
+            # Avoid unsolicited print-namespace requests during connection.
+            # K-profile queries remain available when explicitly requested.
+            logger.debug("[%s] Startup queries: pushall and get_version only", self.serial_number)
             # Immediately broadcast connection state change
             if self.on_state_change:
                 self.on_state_change(self.state)

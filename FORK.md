@@ -13,3 +13,5 @@ Weekly release maintenance preserves these small changes while merging official 
 The automatic Developer Mode ams_filament_setting probe is disabled in bambu_mqtt.py. Preserve passive mode detection and normal user-initiated controls; do not suppress real HMS faults.
 
 UI release 1h: PrinterCardPreview adds a browser-local per-printer live/preview toggle using CameraTile and 20% larger preview dimensions. Update checks use UPDATE_GITHUB_REPO=avalanche208/bambuddy, preserving original upstream attribution. Fork suffixes are compared by date/revision; the publishing workflow creates a GitHub release only after a successful Docker push. Rollback image before these features: 1.2.5.7-fork.2026.10.3.1g.
+
+Release 1i: connection/reconnection sends only pushall and get_version; disable automatic K-profile priming (explicit K-profile retrieval remains available). Keep real HMS faults visible, including retained printer-side faults. Enlarge inline preview to 9rem on desktop and 7.2rem on mobile, with matching status area height.

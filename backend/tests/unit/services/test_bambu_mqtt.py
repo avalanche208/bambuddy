@@ -3810,7 +3810,7 @@ class TestDeveloperModeProbeTimeout:
             mqtt_client._update_state(self._make_pushall_data())
         commands = [next(iter(json.loads(call.args[1]).values()))['command']
                     for call in mqtt_client._client.publish.call_args_list]
-        assert commands == ['pushall', 'get_version', 'extrusion_cali_get'] * 2
+        assert commands == ['pushall', 'get_version'] * 2
 
     def _make_pushall_data(self):
         """Create a print data dict with >30 keys (triggers probe) and no 'fun' field."""
