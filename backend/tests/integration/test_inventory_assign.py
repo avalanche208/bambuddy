@@ -44,6 +44,7 @@ async def spool_factory(db_session: AsyncSession):
 def _make_mock_status(ams_data=None, vt_tray=None, nozzles=None, ams_extruder_map=None):
     """Build a mock printer status with optional AMS/nozzle data."""
     status = MagicMock()
+    status.developer_mode = True
     raw = {}
     if ams_data is not None:
         raw["ams"] = {"ams": ams_data}
@@ -701,8 +702,9 @@ class TestAssignSpoolEmptySlotPreConfig:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    @pytest.mark.parametrize("developer_mode", [True, False, None])
     async def test_on_ams_change_fires_config_when_pre_assigned_slot_loads(
-        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession, developer_mode
     ):
         """Pre-config replay: SpoolAssignment with empty fingerprint + slot now loaded → MQTT fires."""
         from unittest.mock import AsyncMock
@@ -734,6 +736,7 @@ class TestAssignSpoolEmptySlotPreConfig:
         mock_client.extrusion_cali_sel.return_value = True
 
         status = _make_mock_status(ams_data=ams_data)
+        status.developer_mode = developer_mode
         printer_info = MagicMock(name="H2D", serial_number="0948BB540200427")
 
         with (
@@ -753,6 +756,11 @@ class TestAssignSpoolEmptySlotPreConfig:
             mock_ws.broadcast = AsyncMock()
 
             await on_ams_change(printer.id, ams_data)
+
+        if developer_mode is not True:
+            mock_client.ams_set_filament_setting.assert_not_called()
+            mock_client.extrusion_cali_sel.assert_not_called()
+            return
 
         # Full filament setting was published when the slot transitioned to loaded
         mock_client.ams_set_filament_setting.assert_called_once()

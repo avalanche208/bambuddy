@@ -25,9 +25,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: pip install pytest pytest-asyncio paho-mqtt
-      - name: Verify MQTT parsing and disabled automatic probe
-        run: PYTHONPATH=. python -m pytest -c /dev/null --noconftest backend/tests/unit/services/test_bambu_mqtt.py -q
+      - run: pip install -r requirements.txt pytest pytest-asyncio
+      - name: Verify MQTT parsing and background calibration guards
+        run: PYTHONPATH=. python -m pytest -c /dev/null --noconftest backend/tests/unit/services/test_bambu_mqtt.py backend/tests/unit/services/test_kprofile_drift_3219.py backend/tests/unit/services/test_kprofile_nozzle_buckets_2854.py backend/tests/unit/test_fts_kprofile_routing.py backend/tests/unit/services/test_fork_background_backup.py -q
+      - name: Verify inventory assignment and guarded deferred replay
+        run: PYTHONPATH=. python -m pytest backend/tests/integration/test_inventory_assign.py -q
       - run: docker build -t bambuddy:restore-test .
       - name: Verify fork update source and version ordering in image
         run: |

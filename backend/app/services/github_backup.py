@@ -422,7 +422,7 @@ class GitHubBackupService:
 
         for printer in printers:
             client = printer_manager.get_client(printer.id)
-            if not client or not client.state.connected:
+            if not client or not client.state.connected or getattr(client.state, "developer_mode", None) is not True:
                 continue
 
             serial = printer.serial_number

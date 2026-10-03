@@ -302,6 +302,7 @@ class TestPrimeKProfileTable:
     def _printer_state(self, *, nozzles, connected=True):
         return SimpleNamespace(
             connected=connected,
+            developer_mode=True,
             nozzles=[SimpleNamespace(nozzle_diameter=d) for d in nozzles],
         )
 
@@ -313,6 +314,16 @@ class TestPrimeKProfileTable:
             patch.object(main_module.printer_manager, "get_status", return_value=printer_state),
         ):
             return await main_module.prime_kprofile_table(7)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("developer_mode", [None, False])
+    async def test_locked_or_unknown_printer_is_not_queried(self, developer_mode):
+        state = self._printer_state(nozzles=("0.4",))
+        state.developer_mode = developer_mode
+        client = MagicMock()
+        client.get_kprofiles = AsyncMock()
+        assert await self._prime(state, client) == 0
+        client.get_kprofiles.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_it_asks_for_every_fitted_nozzle(self):
@@ -383,6 +394,7 @@ class TestPrimeOnConnectEdge:
         """A real PrinterState: the handler reads far more of it than this
         test cares about, and a stub would only pin the fields I remembered."""
         printer_state = PrinterState()
+        printer_state.developer_mode = True
         printer_state.connected = connected
         printer_state.state = state
         printer_state.nozzles = [NozzleInfo(nozzle_diameter=d) for d in nozzles]
@@ -408,6 +420,18 @@ class TestPrimeOnConnectEdge:
         yield
         main_module._printer_kprofiles_primed_since_connect.pop(31, None)
         main_module._printer_reconciled_since_connect.pop(31, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("developer_mode", [None, False])
+    async def test_boot_without_developer_mode_does_not_schedule_calibration(self, developer_mode):
+        from backend.app import main as main_module
+
+        state = self._state()
+        state.developer_mode = developer_mode
+        for _ in range(3):
+            names = await self._edge(state, main_module)
+            assert not any(name.startswith(("prime-kprofiles", "reapply-kprofiles")) for name in names)
+        assert not main_module._printer_kprofiles_primed_since_connect.get(31, False)
 
     @pytest.mark.asyncio
     async def test_a_connected_printer_with_a_known_nozzle_is_primed(self):

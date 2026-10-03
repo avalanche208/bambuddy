@@ -83,13 +83,14 @@ class TestReSelectOnInletMove:
     """The callback that re-points a moved AMS's slots."""
 
     @staticmethod
-    def _run(inlet, tray, profile, *, connected=True):
+    def _run(inlet, tray, profile, *, connected=True, developer_mode=True):
         """Drive on_fts_inlet_change for one AMS holding one tray."""
         from backend.app import main as main_module
 
         client = MagicMock()
         client.extrusion_cali_sel = MagicMock(return_value=True)
         state = MagicMock()
+        state.developer_mode = developer_mode
         state.raw_data = {"ams": [{"id": "1", "tray": [tray]}]}
         state.nozzles = [MagicMock(nozzle_diameter="0.4")]
 
@@ -113,6 +114,13 @@ class TestReSelectOnInletMove:
 
             asyncio.run(main_module.on_fts_inlet_change(7, 1, inlet))
         return client, lookup
+
+    @pytest.mark.parametrize("developer_mode", [None, False])
+    def test_unknown_or_locked_printer_is_not_reconfigured(self, developer_mode):
+        tray = {"id": "0", "tray_type": "PLA", "cali_idx": 16, "tray_info_idx": "GFA01"}
+        client, lookup = self._run("B", tray, _profile(15, 0, 0.020), developer_mode=developer_mode)
+        lookup.assert_not_awaited()
+        client.extrusion_cali_sel.assert_not_called()
 
     def test_moving_to_in_b_selects_the_right_hotends_profile(self):
         """The reported case, with the maintainer's real numbers."""

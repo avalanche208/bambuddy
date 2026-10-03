@@ -7,7 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 # Application version - single source of truth
-APP_VERSION = "1.2.5.7-fork.2026.10.3.1i"
+APP_VERSION = "1.2.5.7-fork.2026.10.3.1j"
 GITHUB_REPO = "maziggy/bambuddy"
 UPDATE_GITHUB_REPO = "avalanche208/bambuddy"
 BUG_REPORT_RELAY_URL = os.environ.get("BUG_REPORT_RELAY_URL", "https://bambuddy.cool/api/bug-report")

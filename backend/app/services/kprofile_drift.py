@@ -181,7 +181,7 @@ def needs_check(printer_id: int, state) -> bool:
     """Cheap test the status handler runs on every push before spawning a check."""
     if printer_id in _running:
         return False
-    if not getattr(state, "connected", False):
+    if not getattr(state, "connected", False) or getattr(state, "developer_mode", None) is not True:
         return False
     if (getattr(state, "state", "") or "").upper() not in IDLE_STATES:
         return False
@@ -211,6 +211,11 @@ async def reapply_lost_kprofiles(
     state = printer_manager.get_status(printer_id)
     client = printer_manager.get_client(printer_id)
     if state is None or client is None or not getattr(state, "connected", False):
+        return 0
+
+    # Recheck at execution time: authorization may change after scheduling.
+    # throttle=False is the explicit queued-print dispatch path.
+    if throttle and getattr(state, "developer_mode", None) is not True:
         return 0
 
     model = printer_manager.get_model(printer_id)

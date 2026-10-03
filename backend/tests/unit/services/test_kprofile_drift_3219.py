@@ -30,6 +30,7 @@ def _state(trays, *, state="IDLE", connected=True, vt_tray=None, model_nozzles=1
     return SimpleNamespace(
         raw_data=raw,
         connected=connected,
+        developer_mode=True,
         state=state,
         nozzles=nozzles,
         ams_extruder_map=None,
@@ -434,3 +435,19 @@ async def test_a_failing_check_does_not_stop_the_status_broadcast():
             pytest.fail(f"K-profile check escaped the status handler: {exc}")
         except Exception:
             pass  # Later parts of the handler need more of a real state.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("developer_mode", [None, False])
+async def test_background_restore_never_writes_without_confirmed_developer_mode(developer_mode):
+    state = _state([_tray(0)])
+    state.developer_mode = developer_mode
+    assert not kprofile_drift.needs_check(PRINTER, state)
+    client = MagicMock()
+    with (
+        patch.object(kprofile_drift.printer_manager, "get_status", return_value=state),
+        patch.object(kprofile_drift.printer_manager, "get_client", return_value=client),
+    ):
+        # Execution-time guard also protects a task queued before authorization changed.
+        assert await kprofile_drift.reapply_lost_kprofiles(PRINTER) == 0
+    client.extrusion_cali_sel.assert_not_called()

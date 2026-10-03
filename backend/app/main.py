@@ -1604,6 +1604,8 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     if (
         state.connected
         and state_known
+        # Background calibration must never probe an unknown/locked printer.
+        and state.developer_mode is True
         and nozzle_known
         and not _printer_kprofiles_primed_since_connect.get(printer_id, False)
     ):
@@ -2058,7 +2060,7 @@ async def on_fts_inlet_change(printer_id: int, ams_id: int, inlet: str):
 
     client = printer_manager.get_client(printer_id)
     state = printer_manager.get_status(printer_id)
-    if not client or not state or not state.raw_data:
+    if not client or not state or not state.raw_data or state.developer_mode is not True:
         return
 
     # The nozzle the AMS now feeds -- the diameter of the TARGET extruder, not
@@ -2286,7 +2288,12 @@ async def _unlink_stale_assignments(printer_id: int, ams_data: list, printing_no
                     loaded = spool_present(current_tray) is True or (
                         cur_state == 11 or (cur_state not in (9, 10) and cur_type.strip())
                     )
-                    if not fp_type.strip() and loaded and assignment.spool:
+                    if (
+                        not fp_type.strip()
+                        and loaded
+                        and assignment.spool
+                        and getattr(printer_manager.get_status(printer_id), "developer_mode", None) is True
+                    ):
                         try:
                             from backend.app.api.routes.inventory import (
                                 apply_spool_to_slot_via_mqtt,
@@ -2777,7 +2784,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                         # cali_idx differs from the stored value.
                                         # Avoids spamming the broker on every
                                         # MQTT push during steady-state operation.
-                                        if live_cali_idx != chosen_kp.cali_idx:
+                                        if live_cali_idx != chosen_kp.cali_idx and state.developer_mode is True:
                                             client = printer_manager.get_client(printer_id)
                                             if client:
                                                 cali_filament_id = spool.slicer_filament or tray_info_idx or ""
@@ -6289,7 +6296,7 @@ async def prime_kprofile_table(printer_id: int) -> int:
     """
     client = printer_manager.get_client(printer_id)
     state = printer_manager.get_status(printer_id)
-    if client is None or state is None or not state.connected:
+    if client is None or state is None or not state.connected or state.developer_mode is not True:
         return 0
 
     # Deduplicated, order preserved: a dual-nozzle printer with two 0.4s should
