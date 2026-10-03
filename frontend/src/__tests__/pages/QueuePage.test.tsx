@@ -1,0 +1,1788 @@
+/**
+ * Tests for the QueuePage component.
+ */
+
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { render } from '../utils';
+import { QueuePage } from '../../pages/QueuePage';
+import { http, HttpResponse } from 'msw';
+import { server } from '../mocks/server';
+
+// Mock queue data
+const mockQueueItems = [
+  {
+    id: 1,
+    printer_id: 1,
+    archive_id: 1,
+    position: 1,
+    status: 'pending',
+    scheduled_time: null,
+    require_previous_success: false,
+    auto_off_after: false,
+    manual_start: false,
+    ams_mapping: null,
+    plate_id: null,
+    bed_levelling: 'on',
+    flow_cali: 'off',
+    vibration_cali: true,
+    layer_inspect: false,
+    timelapse: false,
+    use_ams: true,
+    started_at: null,
+    completed_at: null,
+    error_message: null,
+    created_at: '2024-01-01T00:00:00Z',
+    archive_name: 'Test Print 1',
+    archive_thumbnail: '/thumb1.png',
+    printer_name: 'Test Printer',
+    print_time_seconds: 3600,
+  },
+  {
+    id: 2,
+    printer_id: 1,
+    archive_id: 2,
+    position: 2,
+    status: 'printing',
+    scheduled_time: null,
+    require_previous_success: false,
+    auto_off_after: true,
+    manual_start: false,
+    ams_mapping: null,
+    plate_id: null,
+    bed_levelling: 'on',
+    flow_cali: 'off',
+    vibration_cali: true,
+    layer_inspect: false,
+    timelapse: false,
+    use_ams: true,
+    started_at: '2024-01-01T10:00:00Z',
+    completed_at: null,
+    error_message: null,
+    created_at: '2024-01-01T00:00:00Z',
+    archive_name: 'Active Print',
+    archive_thumbnail: '/thumb2.png',
+    printer_name: 'Test Printer',
+    print_time_seconds: 7200,
+  },
+  {
+    id: 3,
+    printer_id: 1,
+    archive_id: 3,
+    position: 3,
+    status: 'completed',
+    scheduled_time: null,
+    require_previous_success: false,
+    auto_off_after: false,
+    manual_start: false,
+    ams_mapping: null,
+    plate_id: null,
+    bed_levelling: 'on',
+    flow_cali: 'off',
+    vibration_cali: true,
+    layer_inspect: false,
+    timelapse: false,
+    use_ams: true,
+    started_at: '2024-01-01T08:00:00Z',
+    completed_at: '2024-01-01T09:00:00Z',
+    error_message: null,
+    created_at: '2024-01-01T00:00:00Z',
+    archive_name: 'Completed Print',
+    archive_thumbnail: '/thumb3.png',
+    printer_name: 'Test Printer',
+    print_time_seconds: 1800,
+  },
+];
+
+const mockPrinters = [
+  {
+    id: 1,
+    name: 'Test Printer',
+    ip_address: '192.168.1.100',
+    serial_number: 'TESTSERIAL0001',
+    access_code: '12345678',
+    model: 'X1C',
+    enabled: true,
+    created_at: '2024-01-01T00:00:00Z',
+  },
+];
+
+describe('QueuePage', () => {
+  beforeEach(() => {
+    // Mock localStorage.getItem to return expected defaults for queue page
+    vi.mocked(localStorage.getItem).mockImplementation((key: string) => {
+      if (key === 'queue.historyCollapsed') return 'false'; // expanded
+      if (key === 'queue.viewMode') return 'list';
+      return null;
+    });
+
+    // Setup MSW handlers for this test
+    server.use(
+      http.get('/api/v1/queue/', () => {
+        return HttpResponse.json(mockQueueItems);
+      }),
+      http.get('/api/v1/printers/', () => {
+        return HttpResponse.json(mockPrinters);
+      }),
+      http.delete('/api/v1/queue/:id', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/queue/:id/cancel', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/queue/:id/start', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/queue/:id/stop', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/queue/reorder', () => {
+        return HttpResponse.json({ success: true });
+      })
+    );
+  });
+
+  describe('rendering', () => {
+    it('renders the page title', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Print Queue')).toBeInTheDocument();
+      });
+    });
+
+    it('renders the page description', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Schedule and manage your print jobs')).toBeInTheDocument();
+      });
+    });
+
+    it('shows summary cards', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        // Check for the page title (Print Queue is the h1)
+        expect(screen.getByText('Print Queue')).toBeInTheDocument();
+      });
+    });
+
+    it('shows filter dropdowns', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('All Printers')).toBeInTheDocument();
+        expect(screen.getByText('All Status')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('queue items display', () => {
+    it('shows pending queue items', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Test Print 1')).toBeInTheDocument();
+      });
+    });
+
+    it('shows active printing items', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Active Print')).toBeInTheDocument();
+        expect(screen.getByText('Currently Printing')).toBeInTheDocument();
+      });
+    });
+
+    it('shows the queue override colour instead of the original 3MF colour (#3132)', async () => {
+      const item = {
+        ...mockQueueItems[0],
+        id: 82,
+        printer_id: null,
+        target_model: 'P2S',
+        archive_id: null,
+        library_file_id: 13,
+        archive_name: null,
+        library_file_name: 'Override colour test',
+        plate_id: 1,
+        filament_used_grams: 23.66,
+        filament_type: 'PLA',
+        filament_color: '#7C4B00',
+        filament_overrides: [
+          {
+            slot_id: 1,
+            type: 'PLA',
+            color: '#C2BAA7FF',
+            color_name: 'Bone White',
+            force_color_match: false,
+          },
+        ],
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/13/plates', () =>
+          HttpResponse.json({
+            file_id: 13,
+            filename: 'override-colour.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3095,
+                filament_used_grams: 23.66,
+                filaments: [
+                  {
+                    slot_id: 1,
+                    type: 'PLA',
+                    color: '#7C4B00',
+                    used_grams: 23.7,
+                    used_meters: 7.93,
+                  },
+                ],
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      const colourName = await screen.findByText('Bone White');
+      const row = colourName.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(within(row as HTMLElement).getByTestId('filament-swatch')).toHaveAttribute(
+        'title',
+        '#C2BAA7',
+      );
+    });
+
+    it('shows the resolved AMS slot and bound spool when a physical mapping is stored (#3132)', async () => {
+      const item = {
+        ...mockQueueItems[0],
+        id: 85,
+        printer_id: 1,
+        printer_name: 'Test Printer',
+        archive_id: null,
+        library_file_id: 16,
+        archive_name: null,
+        library_file_name: 'Resolved AMS mapping test',
+        plate_id: 1,
+        ams_mapping: [1],
+        filament_overrides: [
+          {
+            slot_id: 1,
+            type: 'PLA',
+            color: '#8E351BFF',
+            color_name: 'Caramel',
+            force_color_match: false,
+          },
+        ],
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/16/plates', () =>
+          HttpResponse.json({
+            file_id: 16,
+            filename: 'resolved-mapping.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3600,
+                filament_used_grams: 20,
+                filaments: [
+                  {
+                    slot_id: 1,
+                    type: 'PLA',
+                    color: '#7C4B00',
+                    used_grams: 20,
+                    used_meters: 6.7,
+                  },
+                ],
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            id: 1,
+            name: 'Test Printer',
+            connected: true,
+            state: 'IDLE',
+            ams: [
+              {
+                id: 0,
+                // Regular AMS units expose four tray records. Keeping all four
+                // here matters because buildLoadedFilaments distinguishes a
+                // regular AMS from a single-slot AMS-HT by tray count.
+                tray: [
+                  { id: 0, tray_type: null },
+                  {
+                    id: 1,
+                    tray_type: 'PLA',
+                    tray_color: 'C2BAA7FF',
+                    tray_sub_brands: 'PLA Basic',
+                    tray_info_idx: 'GFA00',
+                    remain: 80,
+                  },
+                  { id: 2, tray_type: null },
+                  { id: 3, tray_type: null },
+                ],
+              },
+            ],
+            vt_tray: [],
+            nozzles: [],
+            ams_extruder_map: {},
+          }),
+        ),
+        http.get('/api/v1/printers/:id/inventory-remain', () =>
+          HttpResponse.json({
+            inventory_remain_g: { '1': 800 },
+            slot_materials: [
+              {
+                ams_id: 0,
+                tray_id: 1,
+                global_tray_id: 1,
+                material_key: 'PLA|basic|bone-white',
+                remaining_g: 800,
+                extruder: 0,
+                spool: {
+                  brand: 'eSUN',
+                  material: 'PLA',
+                  subtype: 'Basic',
+                  color_name: 'Bone White',
+                  rgba: 'C2BAA7FF',
+                },
+              },
+            ],
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Resolved AMS mapping test');
+      const row = name.closest('.group');
+      expect(row).not.toBeNull();
+
+      await waitFor(() => {
+        expect(
+          within(row as HTMLElement).getByText('A2 · eSUN PLA Basic · Bone White'),
+        ).toBeInTheDocument();
+      });
+      expect(within(row as HTMLElement).queryByText('Caramel')).not.toBeInTheDocument();
+    });
+
+    it('resolves a mapped tray on a second regular AMS unit (#3132)', async () => {
+      const item = {
+        ...mockQueueItems[0],
+        id: 86,
+        printer_id: 1,
+        printer_name: 'Test Printer',
+        archive_id: null,
+        library_file_id: 17,
+        archive_name: null,
+        library_file_name: 'Second AMS mapping test',
+        plate_id: 1,
+        ams_mapping: [5],
+        filament_overrides: null,
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/17/plates', () =>
+          HttpResponse.json({
+            file_id: 17,
+            filename: 'second-ams.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3600,
+                filament_used_grams: 20,
+                filaments: [
+                  {
+                    slot_id: 1,
+                    type: 'PLA',
+                    color: '#111111',
+                    used_grams: 20,
+                    used_meters: 6.7,
+                  },
+                ],
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            id: 1,
+            name: 'Test Printer',
+            connected: true,
+            state: 'IDLE',
+            ams: [
+              {
+                id: 1,
+                tray: [
+                  { id: 0, tray_type: null },
+                  {
+                    id: 1,
+                    tray_type: 'PLA',
+                    tray_color: 'C2BAA7FF',
+                    tray_sub_brands: 'PLA Basic',
+                    tray_info_idx: 'GFA00',
+                    remain: 80,
+                  },
+                  { id: 2, tray_type: null },
+                  { id: 3, tray_type: null },
+                ],
+              },
+            ],
+            vt_tray: [],
+            nozzles: [],
+            ams_extruder_map: {},
+          }),
+        ),
+        http.get('/api/v1/printers/:id/inventory-remain', () =>
+          HttpResponse.json({
+            inventory_remain_g: { '5': 800 },
+            slot_materials: [
+              {
+                ams_id: 1,
+                tray_id: 1,
+                global_tray_id: 5,
+                material_key: 'PLA|basic|bone-white',
+                remaining_g: 800,
+                extruder: 0,
+                spool: {
+                  brand: 'eSUN',
+                  material: 'PLA',
+                  subtype: 'Basic',
+                  color_name: 'Bone White',
+                  rgba: 'C2BAA7FF',
+                },
+              },
+            ],
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Second AMS mapping test');
+      const row = name.closest('.group');
+      expect(row).not.toBeNull();
+
+      await waitFor(() => {
+        expect(
+          within(row as HTMLElement).getByText('B2 · eSUN PLA Basic · Bone White'),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it('falls back to the selected plate 3MF colour when there is no override (#3132)', async () => {
+      const item = {
+        ...mockQueueItems[0],
+        id: 83,
+        printer_id: null,
+        target_model: 'P2S',
+        archive_id: null,
+        library_file_id: 14,
+        archive_name: null,
+        library_file_name: 'Original colour test',
+        plate_id: 1,
+        filament_color: '#FFFFFF',
+        filament_overrides: null,
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/14/plates', () =>
+          HttpResponse.json({
+            file_id: 14,
+            filename: 'original-colour.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3600,
+                filament_used_grams: 20,
+                filaments: [
+                  {
+                    slot_id: 1,
+                    type: 'PLA',
+                    color: '#7C4B00',
+                    used_grams: 20,
+                    used_meters: 6.7,
+                  },
+                ],
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      await screen.findByText('Original colour test');
+      const row = screen.getByText('Original colour test').closest('.group');
+
+      expect(row).not.toBeNull();
+      await waitFor(() => {
+        expect(within(row as HTMLElement).getByTestId('filament-swatch')).toHaveAttribute(
+          'title',
+          '#7C4B00',
+        );
+      });
+    });
+
+    it('shows all used plate colours and only overrides the matching slot (#3132)', async () => {
+      const item = {
+        ...mockQueueItems[0],
+        id: 84,
+        printer_id: null,
+        target_model: 'P2S',
+        archive_id: null,
+        library_file_id: 15,
+        archive_name: null,
+        library_file_name: 'Multi colour test',
+        plate_id: 1,
+        filament_overrides: [
+          {
+            slot_id: 2,
+            type: 'PLA',
+            color: '#C2BAA7FF',
+            color_name: 'Bone White',
+            force_color_match: false,
+          },
+        ],
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/15/plates', () =>
+          HttpResponse.json({
+            file_id: 15,
+            filename: 'multi-colour.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3600,
+                filament_used_grams: 30,
+                filaments: [
+                  {
+                    slot_id: 1,
+                    type: 'PLA',
+                    color: '#000000',
+                    used_grams: 20,
+                    used_meters: 6.7,
+                  },
+                  {
+                    slot_id: 2,
+                    type: 'PLA',
+                    color: '#7C4B00',
+                    used_grams: 10,
+                    used_meters: 3.35,
+                  },
+                ],
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      const overrideName = await screen.findByText('Bone White');
+      const row = overrideName.closest('.group');
+
+      expect(row).not.toBeNull();
+      await waitFor(() => {
+        const swatches = within(row as HTMLElement).getAllByTestId('filament-swatch');
+        expect(swatches).toHaveLength(2);
+        expect(swatches.map((swatch) => swatch.getAttribute('title'))).toEqual([
+          '#000000',
+          '#C2BAA7',
+        ]);
+      });
+    });
+
+    it('keeps an eight-colour job compact and exposes details in the tooltip (#3132)', async () => {
+      const colours = [
+        '#FF0000',
+        '#00FF00',
+        '#0000FF',
+        '#FFFF00',
+        '#FF00FF',
+        '#00FFFF',
+        '#FFFFFF',
+        '#000000',
+      ];
+      const item = {
+        ...mockQueueItems[0],
+        id: 87,
+        printer_id: null,
+        target_model: 'P2S',
+        archive_id: null,
+        library_file_id: 18,
+        archive_name: null,
+        library_file_name: 'Eight colour test',
+        plate_id: 1,
+        filament_overrides: colours.map((color, index) => ({
+          slot_id: index + 1,
+          type: 'PLA',
+          color,
+          color_name: `Colour ${index + 1}`,
+          force_color_match: false,
+        })),
+      };
+
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([item])),
+        http.get('/api/v1/library/files/18/plates', () =>
+          HttpResponse.json({
+            file_id: 18,
+            filename: 'eight-colour.3mf',
+            plates: [
+              {
+                index: 1,
+                name: 'Plate 1',
+                objects: ['Part'],
+                has_thumbnail: false,
+                thumbnail_url: null,
+                print_time_seconds: 3600,
+                filament_used_grams: 40,
+                filaments: colours.map((color, index) => ({
+                  slot_id: index + 1,
+                  type: 'PLA',
+                  color,
+                  used_grams: 5,
+                  used_meters: 1.7,
+                })),
+              },
+            ],
+            is_multi_plate: false,
+          }),
+        ),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Eight colour test');
+      const row = name.closest('.group');
+      expect(row).not.toBeNull();
+
+      await waitFor(() => {
+        const compact = within(row as HTMLElement).getByTestId('queue-filament-compact');
+        expect(compact).toHaveAttribute(
+          'title',
+          colours.map((_, index) => `Colour ${index + 1}`).join('\n'),
+        );
+        expect(within(compact).getAllByTestId('filament-swatch')).toHaveLength(8);
+      });
+      // Touch screens never show the tooltip; the same lines are the group's
+      // accessible name.
+      expect(screen.getByRole('img', { name: /^Colour 1, Colour 2, .*Colour 8$/ })).toBe(
+        within(row as HTMLElement).getByTestId('queue-filament-compact'),
+      );
+
+      // Compact mode keeps the long labels out of the metadata row itself.
+      expect(within(row as HTMLElement).queryByText('Colour 1')).not.toBeInTheDocument();
+      expect(within(row as HTMLElement).queryByText('Colour 8')).not.toBeInTheDocument();
+    });
+
+    describe('stored mapping on the live printer (#3132)', () => {
+      const mappedItem = (amsMapping: number[]) => ({
+        ...mockQueueItems[0],
+        id: 88,
+        printer_id: 1,
+        printer_name: 'Test Printer',
+        archive_id: null,
+        library_file_id: 19,
+        archive_name: null,
+        library_file_name: 'Mapped slot test',
+        plate_id: 1,
+        ams_mapping: amsMapping,
+        filament_overrides: [
+          {
+            slot_id: 1,
+            type: 'PLA',
+            color: '#8E351BFF',
+            color_name: 'Caramel',
+            force_color_match: false,
+          },
+        ],
+      });
+
+      const useMappedPrinter = (amsMapping: number[], status: Record<string, unknown>) => {
+        server.use(
+          http.get('/api/v1/queue/', () => HttpResponse.json([mappedItem(amsMapping)])),
+          http.get('/api/v1/library/files/19/plates', () =>
+            HttpResponse.json({
+              file_id: 19,
+              filename: 'mapped-slot.3mf',
+              plates: [
+                {
+                  index: 1,
+                  name: 'Plate 1',
+                  objects: ['Part'],
+                  has_thumbnail: false,
+                  thumbnail_url: null,
+                  print_time_seconds: 3600,
+                  filament_used_grams: 20,
+                  filaments: [
+                    { slot_id: 1, type: 'PLA', color: '#7C4B00', used_grams: 20, used_meters: 6.7 },
+                  ],
+                },
+              ],
+              is_multi_plate: false,
+            }),
+          ),
+          http.get('/api/v1/printers/:id/status', () =>
+            HttpResponse.json({
+              id: 1,
+              name: 'Test Printer',
+              state: 'IDLE',
+              nozzles: [],
+              ams_extruder_map: {},
+              ...status,
+            }),
+          ),
+          http.get('/api/v1/printers/:id/inventory-remain', () =>
+            HttpResponse.json({ inventory_remain_g: {}, slot_materials: [] }),
+          ),
+        );
+      };
+
+      // Regular AMS units expose four tray records; slot A3 (global 2) is empty.
+      const amsWithEmptyA3 = [
+        {
+          id: 0,
+          tray: [
+            { id: 0, tray_type: 'PLA', tray_color: 'FFFFFFFF', remain: 50 },
+            { id: 1, tray_type: 'PLA', tray_color: 'C2BAA7FF', remain: 80 },
+            // Firmware confirms A3 has no spool (tray_exist_bits bit clear).
+            { id: 2, tray_type: null, exists: false, state: 9 },
+            { id: 3, tray_type: null },
+          ],
+        },
+      ];
+
+      const mappedRow = async () => {
+        render(<QueuePage />);
+        const name = await screen.findByText('Mapped slot test');
+        const row = name.closest('.group');
+        expect(row).not.toBeNull();
+        return row as HTMLElement;
+      };
+
+      it('resolves a mapping to the external spool', async () => {
+        useMappedPrinter([254], {
+          connected: true,
+          ams: [],
+          vt_tray: [{ id: 254, tray_type: 'PETG', tray_color: 'C2BAA7FF', remain: 60 }],
+        });
+        const row = await mappedRow();
+
+        await waitFor(() => {
+          expect(within(row).getByText(/^External · PETG · /)).toBeInTheDocument();
+        });
+        expect(within(row).queryByText('Caramel')).not.toBeInTheDocument();
+      });
+
+      it('says the mapped slot is empty, keeping the intended colour', async () => {
+        useMappedPrinter([2], { connected: true, ams: amsWithEmptyA3, vt_tray: [] });
+        const row = await mappedRow();
+
+        await waitFor(() => {
+          expect(within(row).getByText('A3 · Empty · Caramel')).toBeInTheDocument();
+        });
+        expect(within(row).getByTestId('filament-swatch')).toHaveAttribute('title', '#8E351B');
+      });
+
+      it('never calls the external spool empty, having no presence signal', async () => {
+        // Shape the status route really sends: an external tray carries no
+        // state / exists, so an unconfigured spool and no spool look the same.
+        let statusServed = false;
+        useMappedPrinter([254], { connected: true, ams: [], vt_tray: [] });
+        server.use(
+          http.get('/api/v1/printers/:id/status', () => {
+            statusServed = true;
+            return HttpResponse.json({ id: 1, name: 'Test Printer', state: 'IDLE', connected: true, ams: [], vt_tray: [{ id: 254, tray_type: '' }], nozzles: [], ams_extruder_map: {} });
+          }),
+        );
+        const row = await mappedRow();
+
+        await waitFor(() => expect(statusServed).toBe(true));
+        expect(await within(row).findByText('Caramel')).toBeInTheDocument();
+        expect(within(row).queryByText(/Empty/)).not.toBeInTheDocument();
+      });
+
+      it('does not call a loaded but unconfigured spool empty (#2527)', async () => {
+        // A non-RFID spool the firmware can't identify has no tray_type but is
+        // physically present; the Printers page draws it as "?", not "Empty".
+        const ams = [
+          {
+            id: 0,
+            tray: [
+              { id: 0, tray_type: 'PLA', tray_color: 'FFFFFFFF', remain: 50 },
+              { id: 1, tray_type: 'PLA', tray_color: 'C2BAA7FF', remain: 80 },
+              { id: 2, tray_type: '', exists: true, state: 3 },
+              { id: 3, tray_type: null },
+            ],
+          },
+        ];
+        let statusServed = false;
+        useMappedPrinter([2], { connected: true, ams, vt_tray: [] });
+        server.use(
+          http.get('/api/v1/printers/:id/status', () => {
+            statusServed = true;
+            return HttpResponse.json({ id: 1, name: 'Test Printer', state: 'IDLE', connected: true, ams, vt_tray: [], nozzles: [], ams_extruder_map: {} });
+          }),
+        );
+        const row = await mappedRow();
+
+        await waitFor(() => expect(statusServed).toBe(true));
+        expect(await within(row).findByText('Caramel')).toBeInTheDocument();
+        expect(within(row).queryByText(/Empty/)).not.toBeInTheDocument();
+      });
+
+      it('does not call a slot empty while the printer is offline', async () => {
+        useMappedPrinter([2], { connected: false, ams: amsWithEmptyA3, vt_tray: [] });
+        const row = await mappedRow();
+
+        expect(await within(row).findByText('Caramel')).toBeInTheDocument();
+        expect(within(row).queryByText(/Empty/)).not.toBeInTheDocument();
+      });
+    });
+
+    it('shows one if-started-now ETA for an eligible pending item', async () => {
+      // Printer 1 is free: nothing is printing on it and nothing is queued ahead.
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([mockQueueItems[0]]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Test Print 1');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      const etaEl = within(row as HTMLElement).getAllByTestId('queue-item-eta');
+      expect(etaEl).toHaveLength(1);
+      // The tooltip must say what the number actually means, not reuse the
+      // printers-page "Estimated completion time" wording (which this is not).
+      expect(etaEl[0]).toHaveAttribute(
+        'title',
+        'Completion time if this job started now',
+      );
+    });
+
+    // The scheduler only writes waiting_reason on the model-based assignment
+    // path, so an item pinned to a specific printer carries no marker at all
+    // while it sits behind a running job. Without the printer-busy check every
+    // one of these quoted the same wrong "starts now" time.
+    it('does not show an ETA for an item pinned behind a running print', async () => {
+      render(<QueuePage />);
+
+      // mockQueueItems[1] ("Active Print") is printing on printer 1, and
+      // "Test Print 1" is pending on the same printer with waiting_reason null.
+      const name = await screen.findByText('Test Print 1');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows the ETA only on the next item up when several share an idle printer', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            { ...mockQueueItems[0], id: 10, position: 1, archive_name: 'First up' },
+            { ...mockQueueItems[0], id: 11, position: 2, archive_name: 'Second up' },
+            { ...mockQueueItems[0], id: 12, position: 3, archive_name: 'Third up' },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      await screen.findByText('Third up');
+
+      const etaRowNames = screen
+        .queryAllByTestId('queue-item-eta')
+        .map((el) => el.closest('.group')?.textContent);
+
+      expect(etaRowNames).toHaveLength(1);
+      expect(etaRowNames[0]).toContain('First up');
+    });
+
+    it('shows an ETA for a staged item queued behind others on an idle printer', async () => {
+      // The scheduler skips manual-start items without claiming the printer, so
+      // a staged job is startable whenever its printer is free — queue order
+      // does not gate it.
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            { ...mockQueueItems[0], id: 20, position: 1, archive_name: 'Auto first' },
+            {
+              ...mockQueueItems[0],
+              id: 21,
+              position: 2,
+              archive_name: 'Staged second',
+              manual_start: true,
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Staged second');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).getAllByTestId('queue-item-eta'),
+      ).toHaveLength(1);
+    });
+
+    it('does not show an ETA for an item conditional on a previous print', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              archive_name: 'Conditional Print',
+              require_previous_success: true,
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Conditional Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('advances the ETA as time passes', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      vi.setSystemTime(new Date('2026-08-02T10:00:00Z'));
+
+      try {
+        server.use(
+          http.get('/api/v1/queue/', () => {
+            return HttpResponse.json([mockQueueItems[0]]);
+          }),
+        );
+
+        render(<QueuePage />);
+
+        const name = await screen.findByText('Test Print 1');
+        const row = name.closest('.group') as HTMLElement;
+        const before = within(row).getByTestId('queue-item-eta').textContent;
+
+        // The queue payload never changes, so react-query hands back the same
+        // object and nothing here re-renders on its own. Only the page's own
+        // clock can move this value.
+        await vi.advanceTimersByTimeAsync(45 * 60 * 1000);
+
+        await waitFor(() => {
+          expect(
+            within(row).getByTestId('queue-item-eta').textContent,
+          ).not.toBe(before);
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('shows one if-started-now ETA for a staged item', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              archive_name: 'Staged Print',
+              manual_start: true,
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Staged Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).getAllByTestId('queue-item-eta'),
+      ).toHaveLength(1);
+    });
+
+    it('shows exactly one live ETA for a printing item', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', ({ params }) => {
+          return HttpResponse.json({
+            id: Number(params.id),
+            name: 'Test Printer',
+            connected: true,
+            state: 'RUNNING',
+            progress: 50,
+            remaining_time: 60,
+            layer_num: 50,
+            total_layers: 100,
+            filename: 'active.3mf',
+          });
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Active Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+
+      await waitFor(() => {
+        expect(
+          within(row as HTMLElement).getAllByText(/^ETA\s/),
+        ).toHaveLength(1);
+      });
+
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('does not show an ETA for a waiting item', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              archive_name: 'Waiting Print',
+              waiting_reason: 'Waiting for matching printer',
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Waiting Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('does not show an if-started-now ETA for a scheduled item', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              archive_name: 'Scheduled Print',
+              scheduled_time: new Date(
+                Date.now() + 5 * 60 * 60 * 1000,
+              ).toISOString(),
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Scheduled Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('tells an unscheduled item when it runs, without naming a dispatch mode', async () => {
+      // ASAP and Queue differ only in where the item is inserted; neither is
+      // stored on it, so this column cannot tell them apart. Labelling every
+      // unscheduled item "ASAP" made a Queue choice look overridden, which is
+      // what both #2557 and #3018 opened on.
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            { ...mockQueueItems[0], archive_name: 'Queued Print', scheduled_time: null },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Queued Print');
+      const row = name.closest('.group') as HTMLElement;
+
+      expect(row).not.toBeNull();
+      expect(within(row).getByText('When a printer is free')).toBeInTheDocument();
+      expect(within(row).queryByText('ASAP')).not.toBeInTheDocument();
+    });
+
+    it('does not render a dangling ETA for an invalid duration', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              archive_name: 'Invalid Duration Print',
+              print_time_seconds: -60,
+            },
+          ]);
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const name = await screen.findByText('Invalid Duration Print');
+      const row = name.closest('.group');
+
+      expect(row).not.toBeNull();
+      expect(
+        within(row as HTMLElement).queryByTestId('queue-item-eta'),
+      ).not.toBeInTheDocument();
+      expect(
+        within(row as HTMLElement).queryByText(/^ETA(?:\s|$)/),
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows completed items in history', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      // The History tab now owns the completed/cancelled/failed list.
+      await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Completed Print')).toBeInTheDocument();
+      });
+    });
+
+    it('shows status badges', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        // Queue items should be visible with status indicators
+        expect(screen.getByText('Test Print 1')).toBeInTheDocument();
+      });
+    });
+
+    it('shows printer names', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        const printerElements = screen.getAllByText('Test Printer');
+        expect(printerElements.length).toBeGreaterThan(0);
+      });
+    });
+
+    it('renders queue items with plate_id correctly', async () => {
+      // Override with queue items that have plate_id set
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              plate_id: 2,
+              archive_name: 'Multi-plate Print',
+            },
+          ]);
+        })
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Multi-plate Print')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('history pagination', () => {
+    // #2682: History rendered the full count in the header but only ever drew
+    // the first 50 rows, with no way to reach the rest. It now paginates with
+    // a "Show more" control.
+    const manyHistory = Array.from({ length: 60 }, (_, i) => ({
+      ...mockQueueItems[2],
+      id: 100 + i,
+      batch_id: null,
+      archive_name: `History Item ${String(i).padStart(2, '0')}`,
+      // Descending completed_at so index 0 is newest and sorts first; the
+      // default History sort is by date, newest first.
+      completed_at: new Date(Date.UTC(2024, 0, 1, 0, 0, 0) - i * 60000).toISOString(),
+    }));
+
+    beforeEach(() => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json(manyHistory);
+        })
+      );
+    });
+
+    it('caps the History list at one page and reveals the rest on Show more', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+      // First page is drawn; an item past the 50-row cap is not.
+      await waitFor(() => {
+        expect(screen.getByText('History Item 00')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('History Item 59')).not.toBeInTheDocument();
+      expect(screen.getByText('Showing 50 of 60')).toBeInTheDocument();
+
+      // Show more reveals the remainder and then disappears (nothing left).
+      await user.click(screen.getByRole('button', { name: /show more/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText('History Item 59')).toBeInTheDocument();
+      });
+      expect(screen.queryByRole('button', { name: /show more/i })).not.toBeInTheDocument();
+    });
+  });
+
+  describe('empty state', () => {
+    it('shows empty state when no queue items', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([]);
+        })
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('No prints scheduled')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('filtering', () => {
+    it('has printer filter options', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('All Printers')).toBeInTheDocument();
+      });
+
+      const printerSelect = screen.getByDisplayValue('All Printers');
+      await user.click(printerSelect);
+
+      expect(screen.getByText('Unassigned')).toBeInTheDocument();
+    });
+
+    it('has status filter options', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('All Status')).toBeInTheDocument();
+      });
+
+      const statusSelect = screen.getByDisplayValue('All Status');
+      await user.click(statusSelect);
+
+      expect(screen.getByRole('option', { name: 'Pending' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Printing' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Completed' })).toBeInTheDocument();
+    });
+  });
+
+  describe('queue actions', () => {
+    it('shows edit button for pending items', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Test Print 1')).toBeInTheDocument();
+      });
+
+      // Find the edit button (Pencil icon)
+      const editButtons = screen.getAllByTitle('Edit');
+      expect(editButtons.length).toBeGreaterThan(0);
+    });
+
+    it('shows cancel button for pending items', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Test Print 1')).toBeInTheDocument();
+      });
+
+      const cancelButtons = screen.getAllByTitle('Cancel');
+      expect(cancelButtons.length).toBeGreaterThan(0);
+    });
+
+    it('shows stop button for printing items', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Active Print')).toBeInTheDocument();
+      });
+
+      const stopButtons = screen.getAllByTitle('Stop Print');
+      expect(stopButtons.length).toBeGreaterThan(0);
+    });
+
+    it('shows re-queue button for history items', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Completed Print')).toBeInTheDocument();
+      });
+
+      const requeueButtons = screen.getAllByTitle('Re-queue');
+      expect(requeueButtons.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('clear history', () => {
+    it('shows clear history button when history exists', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      // Clear History only renders inside the History tab now.
+      await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Clear History')).toBeInTheDocument();
+      });
+    });
+
+    it('opens confirm modal when clicking clear history', async () => {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Clear History')).toBeInTheDocument();
+      });
+
+      const clearButton = screen.getByRole('button', { name: /clear history/i });
+      await user.click(clearButton);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Are you sure you want to remove all/i)).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('staged items', () => {
+    it('shows staged badge for manual_start items', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              manual_start: true,
+            },
+          ]);
+        })
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Staged')).toBeInTheDocument();
+      });
+    });
+
+    it('shows start button for staged items', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => {
+          return HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              manual_start: true,
+            },
+          ]);
+        })
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Start Print')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('auto power off badge', () => {
+    it('shows power off badge when auto_off_after is true', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Auto power off')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('gcode injection badge', () => {
+    it('shows G-code badge when gcode_injection is true', async () => {
+      const itemsWithGcode = mockQueueItems.map((item, i) =>
+        i === 0 ? { ...item, gcode_injection: true } : item
+      );
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json(itemsWithGcode)),
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('G-code')).toBeInTheDocument();
+      });
+    });
+
+    it('does not show G-code badge when gcode_injection is false', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Test Print 1')).toBeInTheDocument();
+      });
+
+      expect(screen.queryByText('G-code')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('outcome prompt badge (#1898)', () => {
+    it('shows the badge only on items with confirm_outcome set', async () => {
+      const items = mockQueueItems.map((item, i) =>
+        i === 0 ? { ...item, confirm_outcome: true } : { ...item, confirm_outcome: false }
+      );
+      server.use(http.get('/api/v1/queue/', () => HttpResponse.json(items)));
+
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Test Print 1')).toBeInTheDocument());
+      const badges = screen.getAllByText('Outcome prompt');
+      expect(badges).toHaveLength(1);
+      expect(badges[0].closest('span')).toHaveAttribute('title', 'Asks how the print came out after it completes');
+    });
+
+    it('renders nothing when no item asks for an outcome', async () => {
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Test Print 1')).toBeInTheDocument());
+      expect(screen.queryByText('Outcome prompt')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('filament-short ▶ flow (#1496)', () => {
+    /**
+     * The dispatch pre-flight flags a queue item as filament_short. The user
+     * clicks ▶, the backend re-checks live and either dispatches (no deficit
+     * anymore — clear flag) or returns 409 with the per-slot deficit so the
+     * frontend can render the "Print Anyway" confirm modal.
+     */
+    const shortItem = {
+      ...mockQueueItems[0],
+      manual_start: true,
+      filament_short: true,
+    };
+
+    it('renders the filament-short badge on a flagged pending row', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([shortItem])),
+      );
+
+      render(<QueuePage />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Insufficient filament for the assigned spool/i)).toBeInTheDocument();
+      });
+    });
+
+    it('opens the Print Anyway modal when ▶ returns 409 and retries with skip_filament_check', async () => {
+      let secondCallSkippedCheck: boolean | null = null;
+      let attempts = 0;
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json([shortItem])),
+        http.post('/api/v1/queue/:id/start', ({ request }) => {
+          attempts += 1;
+          const url = new URL(request.url);
+          const skip = url.searchParams.get('skip_filament_check') === 'true';
+          if (attempts === 1) {
+            return HttpResponse.json(
+              {
+                detail: {
+                  code: 'insufficient_filament',
+                  deficit: [
+                    {
+                      slot_id: 1,
+                      ams_id: 0,
+                      tray_id: 0,
+                      filament_type: 'PLA',
+                      required_grams: 270,
+                      remaining_grams: 200,
+                    },
+                  ],
+                },
+              },
+              { status: 409 },
+            );
+          }
+          secondCallSkippedCheck = skip;
+          return HttpResponse.json({ ...shortItem, manual_start: false, filament_short: false });
+        }),
+      );
+
+      render(<QueuePage />);
+
+      const playButton = await screen.findByTitle(/Start Print|do not have permission to start prints/i);
+      await userEvent.click(playButton);
+
+      // Wait for the start endpoint to be hit (the 409 path returns to onError).
+      await waitFor(() => expect(attempts).toBe(1));
+      // Modal shows the deficit detail
+      await screen.findByRole('button', { name: /Print Anyway/i });
+      expect(
+        screen.getByText(/Slot 1: needs 270 g, 200 g remaining/i),
+      ).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', { name: /Print Anyway/i }));
+
+      await waitFor(() => expect(secondCallSkippedCheck).toBe(true));
+      expect(attempts).toBe(2);
+    });
+  });
+
+  // #2667: mobile can't drag-reorder the queue, so pending rows get up/down
+  // arrows. They persist via the same POST /queue/reorder as drag. The
+  // buttons live in the DOM at every width (Tailwind `sm:hidden` is CSS-only),
+  // so they're clickable in jsdom.
+  describe('mobile reorder arrows (#2667)', () => {
+    const threePending = [1, 2, 3].map((n) => ({
+      ...mockQueueItems[0],
+      id: n,
+      archive_id: n,
+      position: n,
+      status: 'pending',
+      archive_name: `Pending ${n}`,
+    }));
+
+    it('renders Move Up / Move Down controls for pending items', async () => {
+      server.use(http.get('/api/v1/queue/', () => HttpResponse.json(threePending)));
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Pending 1')).toBeInTheDocument());
+
+      // One pair per pending row.
+      expect(screen.getAllByTitle('Move Up')).toHaveLength(3);
+      expect(screen.getAllByTitle('Move Down')).toHaveLength(3);
+    });
+
+    it('moving the first item down persists the swapped order', async () => {
+      let reorderBody: { items: { id: number; position: number }[] } | null = null;
+      server.use(
+        http.get('/api/v1/queue/', () => HttpResponse.json(threePending)),
+        http.post('/api/v1/queue/reorder', async ({ request }) => {
+          reorderBody = (await request.json()) as typeof reorderBody;
+          return HttpResponse.json({ message: 'ok' });
+        }),
+      );
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Pending 1')).toBeInTheDocument());
+
+      // First row's "Move Down": item 1 drops below item 2 → [2, 1, 3].
+      await userEvent.click(screen.getAllByTitle('Move Down')[0]);
+
+      await waitFor(() => expect(reorderBody).not.toBeNull());
+      expect(reorderBody!.items).toEqual([
+        { id: 2, position: 1 },
+        { id: 1, position: 2 },
+        { id: 3, position: 3 },
+      ]);
+    });
+
+    it('disables Move Up on the first row and Move Down on the last', async () => {
+      server.use(http.get('/api/v1/queue/', () => HttpResponse.json(threePending)));
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Pending 1')).toBeInTheDocument());
+
+      // Rows render top-to-bottom in position order.
+      expect(screen.getAllByTitle('Move Up')[0]).toBeDisabled();
+      expect(screen.getAllByTitle('Move Down')[2]).toBeDisabled();
+    });
+  });
+  describe('bulk edit G-code injection (#3058)', () => {
+    /**
+     * gcode_injection is a per-item column the single-item edit modal has
+     * always exposed, and PATCH /queue/bulk has always accepted — only the
+     * bulk dialog left it out, so turning injection on for a whole queue
+     * meant opening every item.
+     */
+    const settingsWithSnippets = {
+      auto_archive: true,
+      gcode_snippets: '{"X1C":{"start_gcode":"","end_gcode":"M400"}}',
+    };
+
+    /** Select the one pending row and open the bulk edit dialog. */
+    const openBulkEdit = async () => {
+      render(<QueuePage />);
+      await waitFor(() => expect(screen.getByText('Test Print 1')).toBeInTheDocument());
+      await userEvent.click(screen.getByText('Select All'));
+      await userEvent.click(await screen.findByTitle('Edit Selected'));
+      return screen.getByText('Edit 1 Item').closest('div')!.parentElement!;
+    };
+
+    it('offers the toggle when a G-code snippet is configured', async () => {
+      server.use(http.get('/api/v1/settings/', () => HttpResponse.json(settingsWithSnippets)));
+
+      await openBulkEdit();
+
+      expect(await screen.findByText('Inject G-code')).toBeInTheDocument();
+    });
+
+    it('hides the toggle when no snippet is configured', async () => {
+      await openBulkEdit();
+
+      // The dialog is open — other queue options are there, injection is not.
+      expect(screen.getByText('Staged (manual start)')).toBeInTheDocument();
+      expect(screen.queryByText('Inject G-code')).not.toBeInTheDocument();
+    });
+
+    it('sends gcode_injection with the bulk PATCH once toggled on', async () => {
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json(settingsWithSnippets)),
+        http.patch('/api/v1/queue/bulk', async ({ request }) => {
+          patchBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ updated_count: 1, skipped_count: 0, message: 'Updated 1 items' });
+        }),
+      );
+
+      const dialog = await openBulkEdit();
+
+      const row = (await screen.findByText('Inject G-code')).closest('div')!;
+      await userEvent.click(within(row).getByText('On'));
+      await userEvent.click(within(dialog).getByText('Apply Changes'));
+
+      await waitFor(() => expect(patchBody).not.toBeNull());
+      expect(patchBody!.item_ids).toEqual([1]);
+      expect(patchBody!.gcode_injection).toBe(true);
+    });
+
+    it('leaves gcode_injection out of the PATCH while it stays on "no change"', async () => {
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json(settingsWithSnippets)),
+        http.patch('/api/v1/queue/bulk', async ({ request }) => {
+          patchBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ updated_count: 1, skipped_count: 0, message: 'Updated 1 items' });
+        }),
+      );
+
+      const dialog = await openBulkEdit();
+
+      // Change something else entirely; injection must not ride along as false.
+      const stagedRow = screen.getByText('Staged (manual start)').closest('div')!;
+      await userEvent.click(within(stagedRow).getByText('On'));
+      await userEvent.click(within(dialog).getByText('Apply Changes'));
+
+      await waitFor(() => expect(patchBody).not.toBeNull());
+      expect(patchBody!.manual_start).toBe(true);
+      expect('gcode_injection' in patchBody!).toBe(false);
+    });
+  });
+
+  describe('bulk edit ask-for-outcome (#1898)', () => {
+    const openBulkEdit = async () => {
+      render(<QueuePage />);
+      await waitFor(() => expect(screen.getByText('Test Print 1')).toBeInTheDocument());
+      await userEvent.click(screen.getByText('Select All'));
+      await userEvent.click(await screen.findByTitle('Edit Selected'));
+      return screen.getByText('Edit 1 Item').closest('div')!.parentElement!;
+    };
+
+    const captureBulkPatch = () => {
+      const captured: { body: Record<string, unknown> | null } = { body: null };
+      server.use(
+        http.patch('/api/v1/queue/bulk', async ({ request }) => {
+          captured.body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ updated_count: 1, skipped_count: 0, message: 'Updated 1 items' });
+        }),
+      );
+      return captured;
+    };
+
+    it('sends confirm_outcome with the bulk PATCH once toggled', async () => {
+      const captured = captureBulkPatch();
+      const dialog = await openBulkEdit();
+
+      const row = within(dialog).getByText('Ask for outcome').closest('div')!;
+      await userEvent.click(within(row).getByText('On'));
+      await userEvent.click(within(dialog).getByText('Apply Changes'));
+
+      await waitFor(() => expect(captured.body).not.toBeNull());
+      expect(captured.body!.item_ids).toEqual([1]);
+      expect(captured.body!.confirm_outcome).toBe(true);
+    });
+
+    it('leaves confirm_outcome out of the PATCH while it stays on "no change"', async () => {
+      const captured = captureBulkPatch();
+      const dialog = await openBulkEdit();
+
+      const timelapseRow = within(dialog).getByText('Timelapse').closest('div')!;
+      await userEvent.click(within(timelapseRow).getByText('On'));
+      await userEvent.click(within(dialog).getByText('Apply Changes'));
+
+      await waitFor(() => expect(captured.body).not.toBeNull());
+      expect(captured.body!.timelapse).toBe(true);
+      expect('confirm_outcome' in captured.body!).toBe(false);
+    });
+  });
+});

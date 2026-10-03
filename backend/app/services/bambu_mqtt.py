@@ -1,4 +1,4 @@
-"""Read-only Bambu Lab MQTT telemetry parser, derived from Bambuddy.
+"""Bambu Lab MQTT communication service.
 
 IMPORTANT: Always use qos=1 for all MQTT publish calls!
 The printer ignores qos=0 messages when busy broadcasting status updates.
@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
+from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import alert_level_from_print_error, describe_fault
 from backend.app.utils.ams_drying import ACTIVE_DRY_STATUSES, DRY_COUNTDOWN_STALL_SECONDS
 from backend.app.utils.ams_humidity import ams_humidity_percent
@@ -1048,6 +1049,9 @@ class PrinterState:
     tray_change_log: list = field(default_factory=list)
     # Firmware version info (from info.module[name="ota"].sw_ver)
     firmware_version: str | None = None
+    # Developer LAN mode: parsed from MQTT "fun" field bit 0x20000000
+    # True = dev mode ON (no encryption), False = dev mode OFF (encryption required), None = unknown
+    developer_mode: bool | None = None
     # AMS Filament Backup: bit 18 of top-level print.cfg hex on new-protocol Bambu
     # printers (H/X/P/H2 families). True=ON, False=OFF, None=unknown (e.g. A1 family
     # which uses the old protocol path; field not yet found). Consumers must treat
@@ -1477,6 +1481,21 @@ class BambuMQTTClient:
         self._request_topic_sub_time: float = 0.0
         self._request_topic_confirmed: bool = False
 
+        # Developer mode probe: when the "fun" field is absent (A1/P1 printers),
+        # we probe by sending an ams_filament_setting and checking the response.
+        # "mqtt message verify failed" → dev mode OFF, success → dev mode ON.
+        self._dev_mode_probed: bool = False
+        self._dev_mode_needs_probe: bool = False  # True after seeing a pushall without "fun"
+        self._dev_mode_probe_seq: str | None = None
+        self._dev_mode_probe_time: float = 0.0  # monotonic timestamp when probe was sent
+        self._dev_mode_probe_failures: int = 0  # consecutive unanswered probes
+        # True while developer_mode=False came from HMS_MQTT_VERIFY_FAILED rather
+        # than from the probe or the "fun" bit. The HMS is a latch, not a level:
+        # the printer reports it until the fault clears, so when a later hms[]
+        # arrives without it (user enabled Developer Mode and restarted the
+        # printer) we drop back to "unknown" and let the probe re-run instead of
+        # leaving a permanently-wrong False behind (#2732).
+        self._dev_mode_from_hms: bool = False
         self._connect_time: float = 0.0  # monotonic timestamp of last _on_connect
 
         # Set when check_staleness() force-closes the socket to trigger reconnect.
@@ -1487,6 +1506,7 @@ class BambuMQTTClient:
         self._last_stale_reconnect: float = 0.0
 
         # Zombie session detection via ams_filament_setting response tracking (#887).
+        # The dev-mode probe only runs on first connect; this catches zombie sessions
         # that develop later (telemetry flows but publishes silently fail).
         self._last_ams_cmd_time: float = 0.0  # monotonic time of last published command
         self._ams_cmd_unanswered: int = 0  # consecutive commands with no response
@@ -1728,6 +1748,17 @@ class BambuMQTTClient:
             self._state_before_power_off = None
             # Reset per-connection warning state so warnings fire once per (re)connection
             self._ams_version_warned = set()
+            # Preserve cached developer_mode across auto-reconnects to avoid
+            # re-probing on every reconnect.  The probe (ams_filament_setting to
+            # ext slot) can destabilize some firmware MQTT brokers, causing a
+            # reconnect → probe → disconnect feedback loop (#887).  Only probe
+            # once when developer_mode is truly unknown (first connect).
+            # Reset probe tracking so stale timeout state doesn't carry over.
+            self._dev_mode_probed = False
+            self._dev_mode_needs_probe = False
+            self._dev_mode_probe_seq = None
+            self._dev_mode_probe_time = 0.0
+            self._dev_mode_probe_failures = 0
             self._connect_time = time.monotonic()
             self._report_messages_since_connect = 0
             self._last_ams_cmd_time = 0.0
@@ -1738,6 +1769,20 @@ class BambuMQTTClient:
             # Dropping is silent (no failure event) on purpose.
             self._pending_assignments.clear()
             client.subscribe(self.topic_subscribe)
+            # Subscribe to request topic for ams_mapping capture (if supported by broker)
+            if self._request_topic_supported:
+                result, mid = client.subscribe(self.topic_publish)
+                if result == mqtt.MQTT_ERR_SUCCESS:
+                    self._request_topic_sub_mid = mid
+                    self._request_topic_sub_time = time.time()
+                    self._request_topic_confirmed = False
+                else:
+                    logger.warning(
+                        "[%s] Failed to send request topic subscription",
+                        self.serial_number,
+                    )
+                    self._request_topic_supported = False
+                    BambuMQTTClient._request_topic_cache[self.serial_number] = False
             # Request full status update (includes nozzle info in push_status response)
             self._request_push_all()
             # Request firmware version info
@@ -1745,7 +1790,7 @@ class BambuMQTTClient:
             # Note: get_accessories returns stale nozzle data on H2D, so we don't use it.
             # The correct nozzle data comes from push_status.
             # Prime K-profile request (Bambu printers often ignore first request)
-
+            self._prime_kprofile_request()
             # Immediately broadcast connection state change
             if self.on_state_change:
                 self.on_state_change(self.state)
@@ -1775,7 +1820,7 @@ class BambuMQTTClient:
             logger.warning(
                 "[%s] MQTT connection refused by the printer: %s (code %s). The access code "
                 "or serial number is wrong — the access code changes every time LAN Only or "
-                "network access settings change, so re-read it from the printer's screen.",
+                "Developer Mode is toggled, so re-read it from the printer's screen.",
                 self.serial_number,
                 name,
                 code,
@@ -2187,6 +2232,16 @@ class BambuMQTTClient:
             if has_ethernet(self.model):
                 self.state.wired_network = self.state.wifi_signal == -90
 
+        # Parse developer LAN mode from top-level "fun" field
+        # Some firmware versions send "fun" at the top level, others inside "print"
+        if "fun" in payload:
+            try:
+                fun_val = payload["fun"]
+                fun_int = fun_val if isinstance(fun_val, int) else int(fun_val, 16)
+                self.state.developer_mode = (fun_int & 0x20000000) == 0
+            except (ValueError, TypeError):
+                pass
+
         if "print" in payload:
             print_data = payload["print"]
 
@@ -2330,6 +2385,115 @@ class BambuMQTTClient:
                     self.state.ams_status_sub,
                 )
 
+            # Check for command responses
+            if "command" in print_data:
+                cmd = print_data.get("command")
+                logger.debug("[%s] Received command response: %s", self.serial_number, cmd)
+                if cmd in ("extrusion_cali_set", "extrusion_cali_del"):
+                    # INFO, not debug: this is the printer's verdict on a write
+                    # the user just made, and it was invisible in support
+                    # bundles for as long as it sat at DEBUG (#2718). Same
+                    # reasoning as ams_filament_drying below.
+                    logger.info(
+                        "[%s] %s response: result=%s reason=%s seq=%s",
+                        self.serial_number,
+                        cmd,
+                        print_data.get("result"),
+                        print_data.get("reason", ""),
+                        print_data.get("sequence_id"),
+                    )
+                    logger.debug("[%s] %s full response: %s", self.serial_number, cmd, print_data)
+                    ack_seq = str(print_data.get("sequence_id", ""))
+                    if ack_seq in self._pending_cali_acks:
+                        self._pending_cali_acks[ack_seq] = print_data
+                elif cmd in ("extrusion_cali_sel", "ams_filament_setting"):
+                    logger.debug("[%s] %s response: %s", self.serial_number, cmd, print_data)
+                    # A refused ams_filament_setting is the printer's verdict on
+                    # a write the user just made, and at DEBUG it never reached
+                    # a support bundle: #2756 reported six manual Configure Slot
+                    # attempts on an X1C, each returning HTTP 200 with the
+                    # read-back still showing the previous profile, and no
+                    # record of what the printer said about any of them. Same
+                    # promotion as extrusion_cali_set (#2718) and
+                    # ams_filament_drying (#1447) — but only on a non-success,
+                    # because unlike those two this command is not rare: every
+                    # spool assignment and every K-profile re-apply sends one,
+                    # so promoting each ack would bury the interesting line.
+                    #
+                    # The developer-mode probe is excluded. It sends this exact
+                    # command to the external slot precisely to see it refused
+                    # on P1 firmware, so its failure is a normal reading rather
+                    # than a fault. Its response is still matched below (this
+                    # runs before _handle_dev_mode_probe_response clears the
+                    # seq), and user-initiated commands can't be mistaken for
+                    # it — they publish a hardcoded sequence_id of "0".
+                    result = print_data.get("result")
+                    is_dev_mode_probe = (
+                        self._dev_mode_probe_seq is not None
+                        and print_data.get("sequence_id") == self._dev_mode_probe_seq
+                    )
+                    if (
+                        cmd == "ams_filament_setting"
+                        and not is_dev_mode_probe
+                        and isinstance(result, str)
+                        and result.lower() != "success"
+                    ):
+                        logger.info(
+                            "[%s] ams_filament_setting refused: result=%s reason=%s ams_id=%s tray_id=%s",
+                            self.serial_number,
+                            result,
+                            print_data.get("reason", ""),
+                            print_data.get("ams_id"),
+                            print_data.get("tray_id"),
+                        )
+                # AMS drying responses are rare (user-initiated only) and the
+                # full payload — including `result` and any `reason` code —
+                # is the only way to diagnose silent rejections like #1447.
+                # INFO level so the body lands in support bundles by default.
+                elif cmd == "ams_filament_drying":
+                    logger.info("[%s] ams_filament_drying response: %s", self.serial_number, print_data)
+                # RFID re-reads are user-initiated and rare, and a refusal was
+                # invisible until #3206 (X1Plus answering FAIL / ERROR STATE).
+                # gcode_line acks are only of interest when they answer our
+                # M620 R fallback, so those are matched by sequence_id alone.
+                ack_seq = str(print_data.get("sequence_id", ""))
+                if (
+                    cmd in ("ams_get_rfid", "gcode_line")
+                    and ack_seq in self._pending_rfid_acks
+                    and "result" in print_data
+                ):
+                    logger.info(
+                        "[%s] %s response: result=%s reason=%s seq=%s",
+                        self.serial_number,
+                        cmd,
+                        print_data.get("result"),
+                        print_data.get("reason", ""),
+                        ack_seq,
+                    )
+                    self._pending_rfid_acks[ack_seq] = print_data
+                # Check for developer mode probe response
+                if (
+                    cmd == "ams_filament_setting"
+                    and self._dev_mode_probe_seq is not None
+                    and print_data.get("sequence_id") == self._dev_mode_probe_seq
+                ):
+                    self._handle_dev_mode_probe_response(print_data)
+                # Track user-initiated ams_filament_setting responses (#887
+                # zombie detection). Reset both the timer AND the unanswered
+                # counter on ANY response — the response proves the channel is
+                # alive, so the counter must not stay armed even when the
+                # watchdog already zeroed `_last_ams_cmd_time` on a previous
+                # tick. The original `and self._last_ams_cmd_time > 0` guard
+                # caused #1164: one sluggish response (>10s) would set the
+                # counter to 1 and zero the timer; the late response arrived
+                # but was ignored by this branch (timer is 0); the counter
+                # stayed at 1 indefinitely; the very next slow response —
+                # possibly hours later, on a totally unrelated command — would
+                # take it to 2 and force-reconnect, surfacing as "filament
+                # config doesn't reach the printer ~6 changes in".
+                elif cmd == "ams_filament_setting":
+                    self._last_ams_cmd_time = 0.0
+                    self._ams_cmd_unanswered = 0
             is_kprofile_response = "command" in print_data and print_data.get("command") == "extrusion_cali_get"
             if is_kprofile_response:
                 self._handle_kprofile_response(print_data)
@@ -4704,6 +4868,7 @@ class BambuMQTTClient:
             hms_list = data["hms"]
             logger.debug("[%s] HMS data received: %s", self.serial_number, hms_list)
             self.state.hms_errors = []
+            verify_failed = False
             if isinstance(hms_list, list):
                 for hms in hms_list:
                     if isinstance(hms, dict):
@@ -4746,7 +4911,11 @@ class BambuMQTTClient:
                         # action table still has some short-form entries, so that
                         # lookup falls back to it.
                         full_code = f"{attr:08X}{code:08X}"
-                        actions = []
+                        if full_code == HMS_MQTT_VERIFY_FAILED:
+                            verify_failed = True
+                        actions = get_actions_for_error_code(self.serial_number[:3], full_code)
+                        if not actions:
+                            actions = get_actions_for_error_code(self.serial_number[:3], short_code.replace("_", ""))
                         self.state.hms_errors.append(
                             HMSError(
                                 code=f"0x{code:x}" if code else "0x0",
@@ -4761,7 +4930,7 @@ class BambuMQTTClient:
                                 description=describe_fault(full_code, self.serial_number[:3]),
                             )
                         )
-
+            self._apply_mqtt_verify_state(verify_failed)
 
         # Parse print_error - this is a different error format than HMS
         # print_error is a 32-bit integer where:
@@ -4808,8 +4977,7 @@ class BambuMQTTClient:
                             # Bambu's HMS catalog keys by 3-letter device code (the SN
                             # prefix) and a 16-char short error code without the
                             # underscore separator we store internally.
-
-                            actions = []
+                            actions = get_actions_for_error_code(self.serial_number[:3], short_code.replace("_", ""))
                             # Bambu pushes the current job as `subtask_id` on the
                             # state stream; the HMS-action commands echo it back as
                             # `job_id`. The error payload itself doesn't carry the
@@ -5116,6 +5284,7 @@ class BambuMQTTClient:
         self.state.raw_data = data
 
         # Restore preserved fields BEFORE any work that may release the GIL
+        # (e.g. _probe_developer_mode publishes an MQTT message).
         if ams_data is not None:
             self.state.raw_data["ams"] = ams_data
         if vt_tray_data is not None:
@@ -5124,6 +5293,68 @@ class BambuMQTTClient:
             self.state.raw_data["ams_extruder_map"] = ams_extruder_map_data
         if mapping_data is not None and "mapping" not in data:
             self.state.raw_data["mapping"] = mapping_data
+
+        # Parse developer LAN mode from "fun" field
+        if "fun" in data:
+            try:
+                fun_val = data["fun"]
+                fun_int = fun_val if isinstance(fun_val, int) else int(fun_val, 16)
+                self.state.developer_mode = (fun_int & 0x20000000) == 0
+            except (ValueError, TypeError):
+                pass
+        elif self.state.developer_mode is None and not self._dev_mode_probed:
+            # No "fun" field — A1/P1 series never send it, so we need to probe.
+            # Two gates: (1) wait for a full pushall (30+ keys) so we don't probe
+            # before a pushall that might contain "fun" arrives, and (2) delay 5s
+            # after connect to let the MQTT session stabilize — probing too early
+            # can destabilize some firmware MQTT brokers (#887).
+            if not self._dev_mode_needs_probe and len(data) > 30:
+                # First full status without "fun" — mark that probe is needed
+                self._dev_mode_needs_probe = True
+            if self._dev_mode_needs_probe and time.monotonic() - self._connect_time >= 5.0:
+                self._probe_developer_mode()
+            elif self._dev_mode_needs_probe:
+                logger.debug(
+                    "[%s] Deferring developer mode probe (%.1fs since connect, need 5s)",
+                    self.serial_number,
+                    time.monotonic() - self._connect_time,
+                )
+        elif self._dev_mode_probed and self._dev_mode_probe_seq is not None:
+            # Probe was sent but no response yet — check for timeout.
+            # A half-broken MQTT session (e.g. after keep-alive timeout reconnect)
+            # may deliver status pushes but silently drop commands (#887).
+            elapsed = time.monotonic() - self._dev_mode_probe_time
+            if elapsed > 10.0:
+                self._dev_mode_probe_failures += 1
+                logger.warning(
+                    "[%s] Developer mode probe timed out after %.0fs (attempt %d)",
+                    self.serial_number,
+                    elapsed,
+                    self._dev_mode_probe_failures,
+                )
+                self._dev_mode_probe_seq = None
+                if self._dev_mode_probe_failures >= 2:
+                    self.force_reconnect_stale_session("developer mode probe unanswered 2×")
+                else:
+                    # Allow retry on next full status message
+                    self._dev_mode_probed = False
+
+        # Zombie session detection: if an ams_filament_setting command has been
+        # pending for >10s with no response, the publish path is likely dead (#887).
+        if self._last_ams_cmd_time > 0:
+            elapsed = time.monotonic() - self._last_ams_cmd_time
+            if elapsed > 10.0:
+                self._ams_cmd_unanswered += 1
+                logger.warning(
+                    "[%s] ams_filament_setting unanswered for %.0fs (count=%d)",
+                    self.serial_number,
+                    elapsed,
+                    self._ams_cmd_unanswered,
+                )
+                self._last_ams_cmd_time = 0.0  # don't re-trigger on next push_status
+                if self._ams_cmd_unanswered >= 2:
+                    self.force_reconnect_stale_session("ams_filament_setting unanswered 2\u00d7")
+                    self._ams_cmd_unanswered = 0
 
         # Log mapping data when received (for usage tracking debugging)
         if "mapping" in data:
@@ -5404,10 +5635,140 @@ class BambuMQTTClient:
         """Request full status update from printer."""
         if self._client:
             message = {"pushing": {"command": "pushall"}}
-            self._publish_read_request(message)
+            self._client.publish(self.topic_publish, json.dumps(message), qos=1)
 
+    def _probe_developer_mode(self):
+        """Probe developer mode by sending an ams_filament_setting for the external slot.
 
+        Some printers (A1/P1 series) never send the "fun" field in MQTT status.
+        For these, we detect developer mode by sending a harmless command and
+        checking whether the printer accepts or rejects it:
+        - result="success" → developer mode ON (commands accepted)
+        - result="failed", reason="mqtt message verify failed" → developer mode OFF
 
+        The probe re-sends the current external slot configuration so it's a no-op
+        when the command succeeds. If there's no external slot data yet, we send a
+        reset (empty filament) which is also safe.
+        """
+        if not self._client or not self.state.connected:
+            return
+        self._dev_mode_probed = True
+        self._dev_mode_probe_time = time.monotonic()
+        self._sequence_id += 1
+        seq = str(self._sequence_id)
+        self._dev_mode_probe_seq = seq
+
+        # Build probe command: re-send current external slot config (no-op on success)
+        vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
+        current = vt_tray[0] if vt_tray else {}
+
+        command = {
+            "print": {
+                "command": "ams_filament_setting",
+                "ams_id": 255,
+                "tray_id": 0,
+                "slot_id": 0,
+                "tray_info_idx": current.get("tray_info_idx", ""),
+                "tray_type": current.get("tray_type", ""),
+                "tray_sub_brands": current.get("tray_sub_brands", ""),
+                "tray_color": current.get("tray_color", "00000000"),
+                "nozzle_temp_min": current.get("nozzle_temp_min", 0),
+                "nozzle_temp_max": current.get("nozzle_temp_max", 0),
+                "sequence_id": seq,
+            }
+        }
+        setting_id = current.get("setting_id")
+        if setting_id:
+            command["print"]["setting_id"] = setting_id
+
+        logger.info("[%s] Probing developer mode via ams_filament_setting (seq=%s)", self.serial_number, seq)
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+
+    def _apply_mqtt_verify_state(self, verify_failed: bool) -> None:
+        """Reconcile developer_mode with the printer's own command-verification verdict.
+
+        ``HMS_MQTT_VERIFY_FAILED`` is the only *direct* evidence we ever get that
+        control commands are being refused, so it outranks the probe in both
+        directions:
+
+        * present  → developer_mode is definitively False, whatever the probe
+          concluded. The probe can only read the response to its own
+          ``ams_filament_setting``; on P1 firmware a refusal is reported here
+          instead, so the probe answers ENABLED while every print silently dies
+          (#2732).
+        * gone again → drop the HMS-derived False back to unknown and re-arm the
+          probe, so a user who enables Developer Mode and restarts the printer
+          isn't stuck behind a verdict nothing would ever revisit.
+
+        A False that came from the probe or the ``fun`` bit is left alone — this
+        only ever unwinds its own latch.
+        """
+        if verify_failed:
+            if not self._dev_mode_from_hms:
+                logger.warning(
+                    "[%s] Printer reported HMS %s (MQTT command verification failed): it is "
+                    "rejecting control commands, so prints, temperature changes and filament "
+                    "loads will be ignored. Enable Developer Mode on the printer and restart it.",
+                    self.serial_number,
+                    HMS_MQTT_VERIFY_FAILED,
+                )
+            self._dev_mode_from_hms = True
+            self.state.developer_mode = False
+            return
+
+        if not self._dev_mode_from_hms:
+            return
+        logger.info(
+            "[%s] HMS %s cleared — re-probing developer mode",
+            self.serial_number,
+            HMS_MQTT_VERIFY_FAILED,
+        )
+        self._dev_mode_from_hms = False
+        self.state.developer_mode = None
+        self._dev_mode_probed = False
+        self._dev_mode_needs_probe = False
+
+    def _handle_dev_mode_probe_response(self, data: dict):
+        """Handle response to the developer mode probe command.
+
+        Sets developer_mode based on whether the printer accepted or rejected the command.
+
+        Three outcomes, not two. An explicit ``success`` proves commands are
+        accepted and an explicit verify-failure proves they are not, but anything
+        else proves nothing — P1S firmware 01.10.00.00 answers this probe with a
+        bare ``{"command": "ams_filament_setting", "sequence_id": "3"}`` and no
+        ``result`` at all, while refusing every control command and reporting
+        ``HMS_MQTT_VERIFY_FAILED`` instead. Reading that empty response as ENABLED
+        is what put ``developer_mode: pass`` in the support bundle of a printer
+        that had not accepted a command all day (#2732). Leaving it unknown makes
+        the connection diagnostic report ``skip``, which is the honest answer.
+        """
+        self._dev_mode_probe_seq = None  # One-shot: don't match future responses
+        self._dev_mode_probe_failures = 0  # Reset on any response
+        result = data.get("result", "")
+        reason = data.get("reason", "")
+
+        if result == "failed" and "verify failed" in reason:
+            self.state.developer_mode = False
+            logger.info("[%s] Developer mode probe: DISABLED (reason=%r)", self.serial_number, reason)
+        elif str(result).lower() == "success":
+            self.state.developer_mode = True
+            logger.info("[%s] Developer mode probe: ENABLED (result=%r)", self.serial_number, result)
+        else:
+            # An HMS verdict already recorded here is real evidence; don't let an
+            # inconclusive probe response wipe it back to unknown.
+            if not self._dev_mode_from_hms:
+                self.state.developer_mode = None
+            logger.info(
+                "[%s] Developer mode probe: INCONCLUSIVE (result=%r, reason=%r) — "
+                "the printer neither confirmed nor refused the command",
+                self.serial_number,
+                result,
+                reason,
+            )
+
+        if self.on_state_change:
+            self.on_state_change(self.state)
 
     def _request_version(self):
         """Request firmware version info from printer."""
@@ -5420,7 +5781,7 @@ class BambuMQTTClient:
                 }
             }
             logger.debug("[%s] Requesting firmware version info", self.serial_number)
-            self._publish_read_request(message)
+            self._client.publish(self.topic_publish, json.dumps(message), qos=1)
 
     def request_status_update(self) -> bool:
         """Request a full status update from the printer (public API).
@@ -5440,7 +5801,38 @@ class BambuMQTTClient:
         # The correct nozzle data comes from push_status response.
         return True
 
+    def _request_accessories(self):
+        """Request accessories info (nozzle type, etc.) from printer."""
+        if self._client:
+            self._sequence_id += 1
+            message = {
+                "system": {
+                    "sequence_id": str(self._sequence_id),
+                    "command": "get_accessories",
+                    "accessory_type": "none",
+                }
+            }
+            logger.debug("[%s] Requesting accessories info", self.serial_number)
+            self._client.publish(self.topic_publish, json.dumps(message), qos=1)
 
+    def _prime_kprofile_request(self):
+        """Send a priming K-profile request on connect.
+
+        Bambu printers often ignore the first K-profile request after connection,
+        so we send a dummy request on connect to 'prime' the system.
+        """
+        if self._client:
+            self._sequence_id += 1
+            command = {
+                "print": {
+                    "command": "extrusion_cali_get",
+                    "filament_id": "",
+                    "nozzle_diameter": "0.4",
+                    "sequence_id": str(self._sequence_id),
+                }
+            }
+            logger.debug("[%s] Sending K-profile priming request", self.serial_number)
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
 
     def connect(self, loop: asyncio.AbstractEventLoop | None = None):
         """Connect to the printer MQTT broker.
@@ -5495,11 +5887,609 @@ class BambuMQTTClient:
         self._client.connect_async(self.ip_address, self.MQTT_PORT, keepalive=30)
         self._client.loop_start()
 
+    def start_print(
+        self,
+        filename: str,
+        plate_id: int = 1,
+        ams_mapping: list[int] | None = None,
+        bed_levelling: str = "auto",
+        flow_cali: str = "auto",
+        vibration_cali: bool = True,
+        layer_inspect: bool = False,
+        timelapse: bool = False,
+        use_ams: bool = True,
+        nozzle_offset_cali: str = "auto",
+        nozzle_mapping: str | None = None,
+        nozzle_slot_extruders: str | None = None,
+    ):
+        """Start a print job on the printer.
 
+        The file should already be uploaded to the printer's root directory via FTP.
 
+        Args:
+            filename: Name of the uploaded file
+            plate_id: Plate number to print (default 1)
+            ams_mapping: List of tray IDs for each filament slot in the 3MF.
+                         Global tray ID = (ams_id * 4) + slot_id, external = 254
+            timelapse: Record timelapse video
+            bed_levelling: Bed levelling — tri-state "off"/"on"/"auto" (auto skips
+                if the bed was levelled recently, matching BambuStudio).
+            flow_cali: Flow/pressure advance calibration — "off"/"on"/"auto".
+            vibration_cali: Vibration compensation calibration
+            layer_inspect: First layer AI inspection
+            use_ams: Use AMS for automatic filament changes
+            nozzle_offset_cali: Nozzle offset calibration — "off"/"on"/"auto"
+                (dual-nozzle printers only — silently ignored on single-nozzle).
+            nozzle_mapping: Opaque JSON string captured from BambuStudio's
+                project_file for H2C rack-swap (O1C2) (#1780). When non-null
+                AND the printer is dual-nozzle, parsed and injected as the
+                `nozzle_mapping` array on the dispatched project_file so the
+                firmware honours the user's slicer pick instead of falling
+                back to "last matching nozzle" auto-pick. Silently ignored
+                on single-nozzle printers.
+            nozzle_slot_extruders: Opaque JSON string of per-filament-slot
+                MQTT extruder indices, derived from the 3MF when no
+                BambuStudio capture exists (#2800). Consulted only on
+                nozzle-rack models (H2C) and only when `nozzle_mapping` did
+                not already supply one; resolved here into physical rack
+                positions using the live `device.nozzle` state. When it
+                cannot be resolved the field is omitted and the firmware
+                picks, as it did before this existed.
 
+        Returns True when the start command was published, False otherwise
+        (not connected, or the printer is already busy — see the run-state
+        guard below).
+        """
+        # Never dispatch project_file to a printer that is not idle (#2598).
+        # This is the single publish choke point for every dispatch path — the
+        # queue scheduler, a manual start, a webhook, and a Virtual-Printer
+        # forwarded job all funnel through here — so one guard covers them all.
+        # The firmware rejects a start while busy with 0500_4004 ("Device is
+        # busy and cannot start a new task"), and on an A1 mini that error
+        # cancels the RUNNING job (#2598). IDLE / FINISH / FAILED are valid
+        # start targets; only the active-print states are refused. (A
+        # transport-level QoS-1 replay on reconnect would bypass this guard,
+        # but the dispatch/watchdog reconnect path hard-resets the client with a
+        # fresh client_id, so paho has no inflight project_file to replay there.)
+        if self.state.state in _ACTIVE_PRINT_STATES:
+            logger.warning(
+                "[%s] start_print refused: printer busy (gcode_state=%s) — not publishing project_file for %s",
+                self.serial_number,
+                self.state.state,
+                filename,
+            )
+            return False
 
+        if self._client and self.state.connected:
+            # Bambu print command format — matches Bambu Studio's format.
+            # The calibration/leveling fields (timelapse, bed_leveling,
+            # flow_cali, vibration_cali, layer_inspect) are JSON booleans for
+            # every model. An earlier revision integer-encoded them for the H2
+            # family (H2D/H2S/H2C/X2D) on the belief that H2 firmware required
+            # 0/1 — but a BambuStudio request-topic capture from a real H2D
+            # sends plain booleans, and the integer encoding made the H2S
+            # silently skip flow-dynamics calibration (#1478). use_ams is the
+            # one field that genuinely must stay boolean: H2D Pro firmware
+            # reads an integer use_ams as a nozzle index (1 = deputy), which is
+            # what actually caused the wrong-extruder routing behind #1386.
+            # Dual-nozzle routing for external spool (254 = deputy/left,
+            # 255 = main/right) and the use_ams=False fallback. H2S is in the
+            # H2 firmware family but is single-nozzle, despite sharing serial
+            # prefix "094" with H2D. Prefer runtime detection from
+            # device.extruder.info (set in _handle_push_status); fall back to
+            # model name for the brief window after connect before push data
+            # arrives. _is_dual_nozzle only ever flips False→True, so it's safe
+            # as the primary signal.
+            from backend.app.utils.printer_models import is_dual_nozzle_model, is_nozzle_rack_model
 
+            is_dual_nozzle = self._is_dual_nozzle or is_dual_nozzle_model(self.model)
+
+            # Build ams_mapping2 from ams_mapping (detailed format with ams_id/slot_id)
+            ams_mapping2 = []
+            # BambuStudio converts virtual tray IDs (254/255) to -1 in the flat
+            # ams_mapping and relies on ams_mapping2 for external spool details.
+            # Passing raw 254/255 in the flat array causes H2D firmware to fail
+            # with 0700_8012 "Failed to get AMS mapping table".
+            flat_ams_mapping = []
+            if ams_mapping is not None:
+                for tray_id in ams_mapping:
+                    # Ensure tray_id is an integer (may be string from JSON)
+                    tray_id = int(tray_id) if tray_id is not None else -1
+                    if tray_id == -1:
+                        # Unmapped filament slot
+                        flat_ams_mapping.append(-1)
+                        ams_mapping2.append({"ams_id": 255, "slot_id": 255})
+                    elif tray_id >= 254:
+                        # External/virtual spool. BambuStudio convention:
+                        #   255 = VIRTUAL_TRAY_MAIN_ID (main/right nozzle)
+                        #   254 = VIRTUAL_TRAY_DEPUTY_ID (deputy/left nozzle)
+                        # Flat mapping must use -1 (firmware doesn't accept raw 254/255).
+                        # Single-nozzle printers (X1C, P1S, A1, etc.) report tray_now=254
+                        # for external spool, but BambuStudio always sends ams_id=255
+                        # (VIRTUAL_TRAY_MAIN_ID) in ams_mapping2. Sending 254 causes the
+                        # firmware to target AMS tray 0 instead of external spool, leading
+                        # to 07FF_8012 "Failed to get AMS mapping table" or stuck prints.
+                        # Only H2D dual-nozzle printers use 254 (deputy/left nozzle).
+                        flat_ams_mapping.append(-1)
+                        ext_ams_id = tray_id if is_dual_nozzle else 255
+                        ams_mapping2.append({"ams_id": ext_ams_id, "slot_id": 0})
+                    elif tray_id >= 128:
+                        # AMS-HT: global tray ID IS the ams_id (single tray per unit)
+                        flat_ams_mapping.append(tray_id)
+                        ams_mapping2.append({"ams_id": tray_id, "slot_id": 0})
+                    elif (_a2l := a2l_lite_wire_ids(tray_id // 4, tray_id)) is not None:
+                        # A2L AMS-Lite (normalised global 24-27): flat mapping is the
+                        # LOCAL slot 0-3 and ams_mapping2 carries {ams_id:16, slot_id:0-3}
+                        # — both CONFIRMED against the firmware's own mapping
+                        # (flat [1], ams_mapping2 {ams_id:16, slot_id:1}).
+                        _wire_ams, _wire_slot, _ = _a2l
+                        flat_ams_mapping.append(_wire_slot)
+                        ams_mapping2.append({"ams_id": _wire_ams, "slot_id": _wire_slot})
+                    else:
+                        # Regular AMS tray: Global tray ID = (ams_id * 4) + slot_id
+                        ams_id = tray_id // 4
+                        slot_id = tray_id % 4
+                        flat_ams_mapping.append(tray_id)
+                        ams_mapping2.append({"ams_id": ams_id, "slot_id": slot_id})
+
+            # Reconcile use_ams against the resolved ams_mapping for single-nozzle
+            # printers — the mapping is authoritative about whether this print
+            # actually feeds from the AMS. Skip for dual-nozzle printers, where
+            # use_ams encodes nozzle routing rather than an AMS on/off flag.
+            # H2S falls through here now (#1386): it is single-nozzle and was
+            # hitting the dual-nozzle bypass, which caused 07FF_8012 when printing
+            # without an AMS attached.
+            #
+            # Two symmetric corrections:
+            #
+            # (a) A mapping that resolves a *real* AMS tray (0-253) forces
+            #     use_ams=True even if it arrived False. A print sent to a Virtual
+            #     Printer is sliced against the VP, which advertises no AMS, so the
+            #     slicer sends use_ams=false and that gets stamped on the queue item
+            #     — but at dispatch the scheduler colour-matches a real printer and
+            #     resolves a real AMS slot. Without this, the stale False reaches the
+            #     printer, which ignores the mapped slot and aborts at layer 0 on the
+            #     empty external spool ("not enough filament"). Diagnosed by
+            #     @Sawtaytoes (#2595, PR #2596).
+            #
+            # (b) Only an *explicit* external/virtual spool (254/255) may downgrade
+            #     to use_ams=False. P1S/P1P with no AMS rejects use_ams=True with
+            #     "Failed to get AMS mapping table". An unresolved slot (-1) does
+            #     NEITHER: it means the mapping was never resolved — e.g. a frontend
+            #     status-load race that persisted [-1] (#2589) — and treating it as
+            #     external silently started the print against an empty feed. A genuine
+            #     external selection is >=254; unresolved is -1; a loaded tray is
+            #     0-253. Keeping them distinct means an unresolved mapping fails loudly
+            #     (or is recomputed upstream) instead of silently going external, and
+            #     never gets force-enabled by (a) either.
+            if ams_mapping and not is_dual_nozzle:
+                has_real_tray = any(t is not None and 0 <= int(t) <= 253 for t in ams_mapping)
+                all_external = all(t is None or int(t) >= 254 for t in ams_mapping)
+                if has_real_tray and not use_ams:
+                    use_ams = True
+                    logger.info(
+                        "[%s] AMS mapping resolved a real slot — setting use_ams=True (#2595)",
+                        self.serial_number,
+                    )
+                elif use_ams and all_external:
+                    use_ams = False
+                    logger.info(
+                        "[%s] All filament slots use external spool — setting use_ams=False",
+                        self.serial_number,
+                    )
+
+            # Unique per-submission identity fields. Hardcoded "0" values caused
+            # third-party MQTT observers (OctoEverywhere, etc.) to see reprints as
+            # continuations of the same job: the printer reuses gcode_start_time
+            # from the prior print with task_id=0, so observers latch onto a stale
+            # timestamp and report compounding durations on repeat replays (#1011).
+            # BambuStudio mints fresh IDs per submission; matching that behavior
+            # makes the printer emit a clean state-transition for each job.
+            # md5 is left empty — firmware historically accepts "" as "skip
+            # validation" (unlike Studio, we don't have the file's real md5 here
+            # without re-reading the upload, and sending a synthetic wrong digest
+            # risks activation of md5 verification on some firmwares).
+            # Cap at signed int32 max: P1S firmware (01.10.00.00) clamps oversized
+            # task identity fields to 2**31-1, so raw epoch-ms (13 digits, ~1.7e12)
+            # overflows and every submission ends up with the same task_id from
+            # the printer's perspective — the printer then treats a fresh dispatch
+            # as a continuation of the last FAILED job and never leaves IDLE (#1042).
+            # Modulo keeps uniqueness within a ~24-day wrap window; `or 1` guards
+            # the (astronomically unlikely) zero case since task_id=0 is rejected.
+            submission_id = str(int(time.time() * 1000) % 2_147_483_647 or 1)
+            # Remember it so on_print_start can persist a restart-stable id on
+            # the archive even before the printer echoes subtask_id back (#1485).
+            self.last_dispatch_subtask_id = submission_id
+
+            # Tri-state calibration options → BambuStudio's getValueInt encoding:
+            # off=0 (never), on=1 (force every print), auto=2 (printer runs it
+            # only if it wasn't done recently). The paired bool field is true
+            # only for the explicit "on" state — for "auto" the bool is false and
+            # the int carries the intent, exactly as BambuStudio's SelectMachine
+            # sends it. Unknown values fall back to auto.
+            _tristate_wire = {"off": 0, "on": 1, "auto": 2}
+            bed_level_int = _tristate_wire.get(bed_levelling, 2)
+            flow_cali_int = _tristate_wire.get(flow_cali, 2)
+            nozzle_cali_int = _tristate_wire.get(nozzle_offset_cali, 2)
+
+            command = {
+                "print": {
+                    "sequence_id": "20000",
+                    "command": "project_file",
+                    "param": f"Metadata/plate_{plate_id}.gcode",
+                    "url": f"ftp://{filename}",
+                    "file": filename,
+                    "md5": "",
+                    "bed_type": "auto",
+                    "timelapse": timelapse,
+                    # bed_leveling stays a JSON bool (true only for "on") and
+                    # auto_bed_leveling carries the tri-state int — the exact
+                    # two-field shape BambuStudio sends. The int must stay a plain
+                    # number, never quoted (#1478 boolean-family concern applies to
+                    # the *_cali bools, not these companion ints).
+                    "bed_leveling": bed_levelling == "on",
+                    "auto_bed_leveling": bed_level_int,
+                    "flow_cali": flow_cali == "on",
+                    "vibration_cali": vibration_cali,
+                    "layer_inspect": layer_inspect,
+                    "use_ams": use_ams,
+                    # No "cfg": it is the printer's device-config bitmask
+                    # (auto-refill, detect-on-insert, chamber light, ...), not a
+                    # per-job field — BambuStudio's PrintParams has no such
+                    # member. We used to send "0"; firmware ignores it, but it
+                    # comes straight back in the project_file ack (#3040).
+                    # extrude_cali_flag gates flow-dynamics calibration:
+                    # 0 = never, 1 = force every print, 2 = auto (run only if the
+                    # filament wasn't calibrated recently). #1721 saw stage 8
+                    # ("Calibrating dynamic flow") still queued when we send 2 —
+                    # that is exactly the auto contract (the printer queues the
+                    # stage and skips it at runtime if recent), not a bug, so 2 is
+                    # the right wire value for "auto". off/on remain 0/1.
+                    "extrude_cali_flag": flow_cali_int,
+                    "extrude_cali_manual_mode": 0,
+                    # 0 = never, 1 = force, 2 = auto (skip if recent). #1721 saw
+                    # stage 39 ("Nozzle offset calibration") still queued on 2 —
+                    # again the auto contract, not a failure to suppress.
+                    # BambuStudio exposes the toggle only for dual-nozzle
+                    # (H2D/H2D Pro/H2C/X2D); single-nozzle prints resolve to 0 so
+                    # firmware never runs a calibration the head doesn't support.
+                    "nozzle_offset_cali": nozzle_cali_int if is_dual_nozzle else 0,
+                    "subtask_name": filename.replace(".3mf", "").replace(".gcode", ""),
+                    "profile_id": "0",
+                    "project_id": submission_id,
+                    "subtask_id": submission_id,
+                    "task_id": submission_id,
+                }
+            }
+
+            # P2S-specific parameter adjustments
+            # P2S printer doesn't support vibration calibration like X1/P1 series
+            if self.model and self.model.upper().strip() in ("P2S", "N7"):
+                command["print"]["vibration_cali"] = False
+                logger.debug("[%s] P2S detected: disabling vibration_cali", self.serial_number)
+
+            # Add AMS mapping if provided
+            if ams_mapping is not None:
+                command["print"]["ams_mapping"] = flat_ams_mapping
+                command["print"]["ams_mapping2"] = ams_mapping2
+
+            # H2C dual-nozzle-rack slicer-pick preservation (#1780).
+            # `nozzle_mapping` carries per-filament physical nozzle position
+            # IDs (`list[int]`), JSON-string-encoded when it leaves the queue
+            # item; parse here so the wire ships an array, matching
+            # BambuStudio's project_file shape. Gate by `is_dual_nozzle`
+            # defensively — single-nozzle firmwares would ignore the field
+            # but we err on the side of not emitting unrecognised fields. A
+            # parse failure is logged but never blocks the dispatch — the
+            # firmware will fall back to its auto-pick path, which is the
+            # pre-fix behaviour.
+            if is_dual_nozzle and nozzle_mapping:
+                try:
+                    command["print"]["nozzle_mapping"] = json.loads(nozzle_mapping)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "[%s] Invalid nozzle_mapping JSON on dispatch, omitting from "
+                        "project_file (firmware will auto-pick): %r",
+                        self.serial_number,
+                        nozzle_mapping,
+                    )
+
+            # Nozzle-rack fallback (#2800). Only consulted when BambuStudio
+            # never saw the job, so it can never override a real capture. The
+            # queue stores extruder indices per filament slot; the physical
+            # rack position they resolve to is only knowable here, because the
+            # mounted hotend can change between queueing and dispatch.
+            if is_nozzle_rack_model(self.model) and nozzle_slot_extruders and "nozzle_mapping" not in command["print"]:
+                try:
+                    slot_extruders = json.loads(nozzle_slot_extruders)
+                except (json.JSONDecodeError, TypeError):
+                    # TypeError covers a caller handing us the list itself
+                    # rather than its JSON — the field is opaque by contract,
+                    # and a print must not die over the difference.
+                    slot_extruders = None
+                    logger.warning(
+                        "[%s] Invalid nozzle_slot_extruders JSON on dispatch, "
+                        "omitting nozzle_mapping (firmware will auto-pick): %r",
+                        self.serial_number,
+                        nozzle_slot_extruders,
+                    )
+
+                if isinstance(slot_extruders, list):
+                    rack_nozzle_id = (
+                        self.state.nozzle_rack_tar_id
+                        if self.state.nozzle_rack_tar_id in _RACK_NOZZLE_IDS
+                        else self.state.nozzle_rack_src_id
+                    )
+                    resolved = resolve_rack_nozzle_mapping(slot_extruders, rack_nozzle_id)
+                    if resolved is None:
+                        logger.info(
+                            "[%s] Nozzle rack slots %s not resolvable (tar_id=%s src_id=%s); "
+                            "omitting nozzle_mapping so the firmware picks",
+                            self.serial_number,
+                            slot_extruders,
+                            self.state.nozzle_rack_tar_id,
+                            self.state.nozzle_rack_src_id,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Nozzle rack mapping: slots=%s rack_id=%s -> %s",
+                            self.serial_number,
+                            slot_extruders,
+                            rack_nozzle_id,
+                            resolved,
+                        )
+                        command["print"]["nozzle_mapping"] = resolved
+
+            logger.info("[%s] Sending print command: %s", self.serial_number, json.dumps(command))
+            # Remember this dispatch so its echo on the topic is recognised as
+            # ours rather than logged as a slicer's.
+            self._own_project_file_key = self._project_file_key(command["print"])
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+            # Record what we dispatched so /cover can pick the right plate
+            # thumbnail even when the printer's gcode_file echo is just the
+            # 3MF filename without a plate path (#1166). Match the same
+            # subtask_name shape we send so the comparison in the cover route
+            # works against state.subtask_name reflected back via MQTT.
+            self.state.dispatched_plate_id = plate_id
+            self.state.dispatched_subtask = command["print"]["subtask_name"]
+            return True
+        else:
+            # Log why we couldn't send the command
+            if not self._client:
+                logger.error("[%s] Cannot start print: MQTT client not initialized", self.serial_number)
+            elif not self.state.connected:
+                logger.error(
+                    f"[{self.serial_number}] Cannot start print: Printer not connected (client exists but disconnected). "
+                    f"Connection state: {self.state.connected}, Last message: {self._last_message_time}"
+                )
+            return False
+
+    def stop_print(self) -> bool:
+        """Stop the current print job."""
+        if self._client and self.state.connected:
+            command = {"print": {"command": "stop", "sequence_id": "0"}}
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+            logger.info("[%s] Sent stop print command", self.serial_number)
+            return True
+        return False
+
+    def set_xcam_option(
+        self, module_name: str, enabled: bool, print_halt: bool = True, sensitivity: str = "medium"
+    ) -> bool:
+        """Set an xcam (AI detection) option on the printer.
+
+        Args:
+            module_name: The xcam module to control (e.g., "spaghetti_detector",
+                        "first_layer_inspector", "printing_monitor", "buildplate_marker_detector")
+            enabled: Whether to enable or disable the feature
+            print_halt: Whether to halt print on detection (only applies to some detectors)
+            sensitivity: Sensitivity level ("low", "medium", "high", or "never_halt")
+
+        Returns:
+            True if command was sent, False if not connected
+        """
+        if not self._client or not self.state.connected:
+            return False
+
+        # auto_recovery_step_loss uses a different command format (print.print_option)
+        if module_name == "auto_recovery_step_loss":
+            return self._set_print_option("auto_recovery", enabled)
+
+        self._sequence_id += 1
+
+        # Build the xcam control command (exact OrcaSlicer format)
+        # Key findings from OrcaSlicer source:
+        # - Uses "xcam" wrapper (not "print")
+        # - print_halt is ALWAYS true (legacy protocol requirement)
+        # - Both "control" and "enable" are set to the same value
+        # - halt_print_sensitivity controls actual halt behavior
+        command = {
+            "xcam": {
+                "command": "xcam_control_set",
+                "sequence_id": str(self._sequence_id),
+                "module_name": module_name,
+                "control": enabled,
+                "enable": enabled,  # old protocol compatibility
+                "print_halt": True,  # ALWAYS true per OrcaSlicer
+            }
+        }
+
+        # Only add sensitivity if not "never_halt"
+        # OrcaSlicer uses halt_print_sensitivity for ALL detectors
+        # The module_name field determines which detector's sensitivity is being set
+        if sensitivity and sensitivity != "never_halt":
+            command["xcam"]["halt_print_sensitivity"] = sensitivity
+
+        command_json = json.dumps(command)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        logger.debug(
+            "[%s] Set xcam option: %s=%s, sensitivity=%s", self.serial_number, module_name, enabled, sensitivity
+        )
+        logger.debug("[%s] MQTT command sent: %s", self.serial_number, command_json)
+
+        # OrcaSlicer pattern: Set hold timer to ignore incoming data for 3 seconds
+        # This prevents stale MQTT data from immediately overwriting our change
+        self._xcam_hold_start[module_name] = time.time()
+
+        # Update local state immediately for responsive UI
+        # NOTE: Spaghetti and Pileup sensitivities are linked in firmware
+        # When spaghetti_detector sensitivity is changed, pileup also changes
+        if module_name == "spaghetti_detector":
+            self.state.print_options.spaghetti_detector = enabled
+            self.state.print_options.print_halt = print_halt
+            if sensitivity and sensitivity != "never_halt":
+                # spaghetti_detector controls BOTH spaghetti and pileup sensitivities
+                self.state.print_options.halt_print_sensitivity = sensitivity
+                self.state.print_options.pileup_sensitivity = sensitivity
+                self._xcam_hold_start["halt_print_sensitivity"] = time.time()
+                self._xcam_hold_start["pileup_sensitivity"] = time.time()
+        elif module_name == "first_layer_inspector":
+            self.state.print_options.first_layer_inspector = enabled
+        elif module_name == "printing_monitor":
+            self.state.print_options.printing_monitor = enabled
+        elif module_name == "buildplate_marker_detector":
+            self.state.print_options.buildplate_marker_detector = enabled
+        elif module_name == "allow_skip_parts":
+            self.state.print_options.allow_skip_parts = enabled
+        elif module_name == "pileup_detector":
+            self.state.print_options.pileup_detector = enabled
+            # Pileup sensitivity is linked to spaghetti - both are set via spaghetti_detector
+        elif module_name == "clump_detector":
+            self.state.print_options.nozzle_clumping_detector = enabled
+            if sensitivity and sensitivity != "never_halt":
+                self.state.print_options.nozzle_clumping_sensitivity = sensitivity
+                self._xcam_hold_start["nozzle_clumping_sensitivity"] = time.time()
+        elif module_name == "airprint_detector":
+            self.state.print_options.airprint_detector = enabled
+            if sensitivity and sensitivity != "never_halt":
+                self.state.print_options.airprint_sensitivity = sensitivity
+                self._xcam_hold_start["airprint_sensitivity"] = time.time()
+        elif module_name == "auto_recovery_step_loss":
+            self.state.print_options.auto_recovery_step_loss = enabled
+
+        return True
+
+    def _set_print_option(self, option_name: str, enabled: bool) -> bool:
+        """Set a print option using the print.print_option command.
+
+        This is different from xcam_control_set and is used for options like:
+        - auto_recovery
+        - air_print_detect
+        - filament_tangle_detect
+        - nozzle_blob_detect
+        - sound_enable
+
+        Args:
+            option_name: The option to control (e.g., "auto_recovery")
+            enabled: Whether to enable or disable the option
+
+        Returns:
+            True if command was sent, False if not connected
+        """
+        if not self._client or not self.state.connected:
+            return False
+
+        self._sequence_id += 1
+
+        command = {
+            "print": {
+                "command": "print_option",
+                "sequence_id": str(self._sequence_id),
+                option_name: enabled,
+            }
+        }
+
+        command_json = json.dumps(command)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        logger.debug("[%s] Set print option: %s=%s", self.serial_number, option_name, enabled)
+
+        # Set hold timer
+        hold_key = f"print_option_{option_name}"
+        self._xcam_hold_start[hold_key] = time.time()
+
+        # Update local state immediately
+        if option_name == "auto_recovery":
+            self.state.print_options.auto_recovery_step_loss = enabled
+        elif option_name == "auto_switch_filament":
+            self.state.ams_filament_backup = enabled
+
+        return True
+
+    def set_ams_filament_backup(self, enabled: bool) -> bool:
+        """Toggle AMS Filament Backup (a.k.a. auto-switch / auto-refill).
+
+        Mirrors BambuStudio's "AMS Filament Backup" checkbox. Verified payload
+        shape from H2D capture 2026-06-20.
+        """
+        return self._set_print_option("auto_switch_filament", enabled)
+
+    def start_calibration(
+        self,
+        bed_leveling: bool = False,
+        vibration: bool = False,
+        motor_noise: bool = False,
+        nozzle_offset: bool = False,
+        high_temp_heatbed: bool = False,
+    ) -> bool:
+        """Start printer calibration with selected options.
+
+        Args:
+            bed_leveling: Run bed leveling calibration
+            vibration: Run vibration compensation calibration
+            motor_noise: Run motor noise cancellation calibration
+            nozzle_offset: Run nozzle offset calibration (dual nozzle printers)
+            high_temp_heatbed: Run high-temperature heatbed calibration
+
+        Returns:
+            True if command was sent, False if not connected
+        """
+        if not self._client or not self.state.connected:
+            return False
+
+        # Build calibration bitmask based on OrcaSlicer DeviceManager.cpp
+        # Bit 0: xcam_cali (not exposed in UI)
+        # Bit 1: bed_leveling
+        # Bit 2: vibration
+        # Bit 3: motor_noise
+        # Bit 4: nozzle_cali
+        # Bit 5: bed_cali (high-temp heatbed)
+        # Bit 6: clumppos_cali (not exposed in UI)
+        option = 0
+        if bed_leveling:
+            option |= 1 << 1
+        if vibration:
+            option |= 1 << 2
+        if motor_noise:
+            option |= 1 << 3
+        if nozzle_offset:
+            option |= 1 << 4
+        if high_temp_heatbed:
+            option |= 1 << 5
+
+        if option == 0:
+            logger.warning("[%s] No calibration options selected", self.serial_number)
+            return False
+
+        self._sequence_id += 1
+
+        command = {
+            "print": {
+                "command": "calibration",
+                "sequence_id": str(self._sequence_id),
+                "option": option,
+            }
+        }
+
+        command_json = json.dumps(command)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        logger.info(
+            f"[{self.serial_number}] Starting calibration: "
+            f"bed_leveling={bed_leveling}, vibration={vibration}, "
+            f"motor_noise={motor_noise}, nozzle_offset={nozzle_offset}, "
+            f"high_temp_heatbed={high_temp_heatbed} (option={option})"
+        )
+
+        return True
 
     def disconnect(self, timeout: float = 0):
         """Disconnect from the printer.
@@ -5529,6 +6519,20 @@ class BambuMQTTClient:
             # The callers drop the client from the manager anyway, so the next
             # status read already shows it gone.
 
+    def send_command(self, command: dict):
+        """Send a command to the printer."""
+        if self._client and self.state.connected:
+            # Log outgoing message if logging is enabled
+            if self._logging_enabled:
+                self._message_log.append(
+                    MQTTLogEntry(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        topic=self.topic_publish,
+                        direction="out",
+                        payload=command,
+                    )
+                )
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
 
     def enable_logging(self, enabled: bool = True):
         """Enable or disable MQTT message logging."""
@@ -5548,9 +6552,106 @@ class BambuMQTTClient:
         """Check if logging is enabled."""
         return self._logging_enabled
 
+    def register_raw_message_handler(self, handler: Callable[[str, bytes], None]) -> None:
+        """Register a handler invoked for every incoming MQTT message.
 
+        Used by the VP MQTT bridge to republish the printer's report pushes to
+        slicers connected to a virtual printer in non-proxy mode. Handlers run
+        on paho's network thread and must not block; exceptions are caught.
+        """
+        if handler not in self._raw_message_handlers:
+            self._raw_message_handlers.append(handler)
 
+    def unregister_raw_message_handler(self, handler: Callable[[str, bytes], None]) -> None:
+        """Unregister a previously-registered raw-message handler."""
+        try:
+            self._raw_message_handlers.remove(handler)
+        except ValueError:
+            pass
 
+    def publish_raw(self, topic: str, payload: bytes | str, qos: int = 1) -> bool:
+        """Publish a pre-formed payload directly to the printer's MQTT broker.
+
+        Used by the VP MQTT bridge to forward slicer-originated commands without
+        going through send_command's sequence-id mangling. Returns False if the
+        underlying paho client isn't ready.
+        """
+        if self._client is None:
+            return False
+        try:
+            info = self._client.publish(topic, payload, qos=qos)
+            return info.rc == mqtt.MQTT_ERR_SUCCESS
+        except Exception:
+            logger.exception("[%s] publish_raw failed for topic=%s", self.serial_number, topic)
+            return False
+
+    def send_drying_command(
+        self, ams_id: int, temp: int, duration: int, mode: int = 1, filament: str = "", rotate_tray: bool = False
+    ):
+        """Send AMS drying start/stop command.
+
+        Args:
+            ams_id: AMS unit ID (0-3 for AMS 2 Pro, 128-135 for AMS-HT)
+            temp: Target drying temperature (45-65 for AMS 2 Pro, 45-85 for AMS-HT)
+            duration: Drying duration in hours
+            mode: 1=start, 0=stop
+            filament: Filament type string (e.g. "PLA", "PETG")
+            rotate_tray: Whether to rotate the spool during drying for even heat
+        """
+        if not self._client:
+            return False
+        self._sequence_id += 1
+        # A2L AMS-Lite: normalised id 6 -> physical 16 on the wire (the Lite does
+        # not actually support drying, but keep the translation consistent). The
+        # _drying_targets dict below stays keyed by the normalised id so the
+        # on_drying_complete callback matches the telemetry.
+        wire_ams_id = a2l_lite_wire_ids(ams_id, 0)[0] if ams_id == A2L_LITE_NORMALIZED_AMS_ID else ams_id
+        command = {
+            "print": {
+                "sequence_id": str(self._sequence_id),
+                "command": "ams_filament_drying",
+                "ams_id": wire_ams_id,
+                "temp": temp,
+                "cooling_temp": 20 if mode == 1 else 0,
+                "duration": duration,
+                "humidity": 0,
+                "mode": mode,
+                "rotate_tray": rotate_tray,
+                "filament": filament,
+                "close_power_conflict": False,
+            }
+        }
+        # Log the full wire JSON at INFO so support bundles capture exactly
+        # what we sent — needed to diagnose silent rejections (#1447) where
+        # the printer ACKs the command but never starts/stops drying.
+        # Paired with the ams_filament_drying response-payload INFO log so
+        # both halves of the conversation land in the bundle by default.
+        wire_json = json.dumps(command)
+        self._client.publish(self.topic_publish, wire_json, qos=1)
+        logger.info(
+            "[%s] Sent ams_filament_drying: %s",
+            self.serial_number,
+            wire_json,
+        )
+        # Track the active-cycle target so the badge can show "PETG @ 65°C"
+        # while drying. Bambu only echoes dry_time on subsequent pushes.
+        # duration_hours is not shown anywhere; it is what lets the cycle-end log
+        # say how much of the requested time the firmware actually ran (#2770).
+        if mode == 1:
+            self._drying_targets[ams_id] = {
+                "filament": filament or "",
+                "temp": int(temp),
+                "duration_hours": int(duration),
+            }
+            self._drying_stops_sent.discard(ams_id)
+        else:
+            self._drying_targets.pop(ams_id, None)
+            # Remember that this cycle's end is ours, so the cycle-end log
+            # attributes it to Bambuddy instead of to the firmware (#2770). A
+            # stop always ends the cycle far short of its duration, which is
+            # otherwise indistinguishable from the firmware abandoning it.
+            self._drying_stops_sent.add(ams_id)
+        return True
 
     @staticmethod
     def _parse_kprofile_entries(filaments: list, response_nozzle: str | None, log_errors: bool) -> list[KProfile]:
@@ -5703,63 +6804,1677 @@ class BambuMQTTClient:
             # Fallback for when loop is not available
             event.set()
 
+    async def get_kprofiles(
+        self, nozzle_diameter: str = "0.4", timeout: float = 5.0, max_retries: int = 3
+    ) -> list[KProfile]:
+        """Request K-profiles from the printer with retry logic.
 
+        Bambu printers sometimes ignore the first K-profile request, so we
+        implement retry logic to ensure reliable retrieval.
 
+        Args:
+            nozzle_diameter: Filter by nozzle diameter (e.g., "0.4")
+            timeout: Timeout in seconds to wait for each response attempt
+            max_retries: Maximum number of retry attempts
 
+        Returns:
+            List of KProfile objects
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot get K-profiles: not connected", self.serial_number)
+            return []
 
+        # Capture current event loop for thread-safe callback
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("[%s] No running event loop", self.serial_number)
+            return []
 
+        for attempt in range(max_retries):
+            # Register this attempt under its own sequence_id so a concurrent
+            # request for a different nozzle size can't consume its response
+            # (#1748) — the pending map is keyed by exactly the id we send.
+            self._sequence_id += 1
+            seq_id = str(self._sequence_id)
+            request: dict = {"nozzle": nozzle_diameter, "event": asyncio.Event(), "profiles": None}
+            self._pending_kprofile_requests[seq_id] = request
+
+            # Send the command with nozzle_diameter filter
+            command = {
+                "print": {
+                    "command": "extrusion_cali_get",
+                    "filament_id": "",
+                    "nozzle_diameter": nozzle_diameter,
+                    "sequence_id": seq_id,
+                }
+            }
+
+            logger.info(
+                f"[{self.serial_number}] Requesting K-profiles for nozzle_diameter={nozzle_diameter} (attempt {attempt + 1}/{max_retries}, seq_id={seq_id})"
+            )
+            logger.debug("[%s] K-profile request JSON: %s", self.serial_number, json.dumps(command))
+
+            # Wait for the response (the handler matches it back to this entry)
+            try:
+                self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+                await asyncio.wait_for(request["event"].wait(), timeout=timeout)
+                profiles = request["profiles"] or []
+                logger.info(
+                    f"[{self.serial_number}] Got {len(profiles)} K-profiles for nozzle={nozzle_diameter} on attempt {attempt + 1}"
+                )
+                return profiles
+            except TimeoutError:
+                logger.warning(
+                    f"[{self.serial_number}] Timeout on K-profiles request attempt {attempt + 1}/{max_retries}"
+                )
+                if attempt < max_retries - 1:
+                    # Brief delay before retry
+                    await asyncio.sleep(0.5)
+            finally:
+                self._pending_kprofile_requests.pop(seq_id, None)
+
+        logger.error("[%s] Failed to get K-profiles after %s attempts", self.serial_number, max_retries)
+        return []
+
+    def _publish_cali_write(self, command: dict, seq_id: str) -> bool:
+        """Publish a K-profile write and arm its ack slot.
+
+        Registration happens before the publish because the printer answers in
+        well under a second — measured at 70-150ms — which is comfortably
+        before an async caller gets back to awaiting.
+        """
+        self._pending_cali_acks[seq_id] = None
+        try:
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        except Exception:
+            self._pending_cali_acks.pop(seq_id, None)
+            raise
+        return True
+
+    async def await_cali_ack(self, seq_id: str, timeout: float = 6.0) -> tuple[bool, str]:
+        """Wait for the printer's verdict on a K-profile write.
+
+        Returns ``(ok, detail)``. ``ok`` is False only when the printer
+        explicitly said ``result: "fail"`` — a timeout returns True with a
+        detail string, because "no answer" is not evidence of rejection and
+        older firmware may not answer at all. Callers that need certainty read
+        the calibration table back.
+
+        Polled rather than event-driven on purpose: the ack is filled in by the
+        MQTT callback thread, and polling a dict costs one lookup every 50ms
+        for at most a few hundred milliseconds, against the cross-thread
+        event plumbing it would otherwise take.
+        """
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                ack = self._pending_cali_acks.get(seq_id)
+                if ack is not None:
+                    result = str(ack.get("result", "")).lower()
+                    reason = str(ack.get("reason", "") or "")
+                    if result == "fail":
+                        return (False, reason or "printer reported failure")
+                    return (True, reason)
+                await asyncio.sleep(0.05)
+        finally:
+            self._pending_cali_acks.pop(seq_id, None)
+        logger.warning("[%s] No ack for K-profile write seq=%s within %.1fs", self.serial_number, seq_id, timeout)
+        return (True, "no acknowledgement from printer")
+
+    def set_kprofile(
+        self,
+        filament_id: str,
+        name: str,
+        k_value: str,
+        nozzle_diameter: str = "0.4",
+        nozzle_id: str = "HS00-0.4",
+        extruder_id: int = 0,
+        setting_id: str | None = None,
+        slot_id: int = 0,
+        cali_idx: int | None = None,
+    ) -> str | None:
+        """Set/update a K-profile on the printer.
+
+        Args:
+            filament_id: Bambu filament identifier
+            name: Profile name
+            k_value: Pressure advance value (e.g., "0.020000")
+            nozzle_diameter: Nozzle diameter (e.g., "0.4")
+            nozzle_id: Nozzle identifier (e.g., "HS00-0.4")
+            extruder_id: Extruder ID (0 or 1 for dual nozzle)
+            setting_id: Existing setting ID for updates, None for new
+            slot_id: Calibration index (cali_idx) for the profile
+            cali_idx: For edits, the existing slot being edited (enables in-place edit)
+
+        Returns:
+            The sequence_id the command was sent under, so the caller can
+            await the printer's verdict via await_cali_ack. None if the
+            command could not be sent.
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set K-profile: not connected", self.serial_number)
+            return None
+
+        self._sequence_id += 1
+        seq_id = str(self._sequence_id)
+
+        # Build the filament entry - printer uses cali_idx for profile identification
+        # For new profiles (slot_id=0), use cali_idx=-1 to tell printer to create new slot
+        # For edits, use the provided cali_idx or slot_id
+        if cali_idx is not None:
+            effective_cali_idx = cali_idx
+        else:
+            effective_cali_idx = -1 if slot_id == 0 else slot_id
+
+        # Generate a setting_id for new profiles (required by printer)
+        # Format: "PF" + 17 random digits
+        import random
+
+        if not setting_id and slot_id == 0:
+            setting_id = f"PF{random.randint(10000000000000000, 99999999999999999)}"
+
+        filament_entry = {
+            "ams_id": 0,
+            "cali_idx": effective_cali_idx,
+            "extruder_id": extruder_id,
+            "filament_id": filament_id,
+            "k_value": k_value,
+            "n_coef": "0.000000",
+            "name": name,
+            "nozzle_diameter": nozzle_diameter,
+            "nozzle_id": nozzle_id,
+            "setting_id": setting_id if setting_id else "",
+            # 0, not -1. Single-nozzle firmware validates this field and
+            # answers `result: "fail", reason: "invalid tray_id"` to -1 — while
+            # applying the write anyway, so the rejection looked like noise.
+            # Measured on an X1C: flipping only this value turns the ack into
+            # `success` (#2718). BambuStudio always sends a real tray_id and
+            # defaults it to 0 for a manually entered profile.
+            "tray_id": 0,
+        }
+
+        command = {
+            "print": {
+                "command": "extrusion_cali_set",
+                "filaments": [filament_entry],
+                "nozzle_diameter": nozzle_diameter,
+                "sequence_id": seq_id,
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info(
+            f"[{self.serial_number}] Setting K-profile: {name} = {k_value} (cali_idx={effective_cali_idx}, new={slot_id == 0})"
+        )
+        logger.debug("[%s] K-profile SET command: %s", self.serial_number, command_json)
+        self._publish_cali_write(command, seq_id)
+        return seq_id
+
+    def set_kprofiles_batch(
+        self,
+        profiles: list[dict],
+        nozzle_diameter: str = "0.4",
+    ) -> str | None:
+        """Set multiple K-profiles in a single command (for dual-nozzle).
+
+        Args:
+            profiles: List of profile dicts, each with:
+                - filament_id, name, k_value, nozzle_id, extruder_id, setting_id (optional), slot_id
+            nozzle_diameter: Common nozzle diameter for all profiles
+
+        Returns:
+            The sequence_id the command was sent under (see set_kprofile),
+            or None if it could not be sent.
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set K-profiles batch: not connected", self.serial_number)
+            return None
+
+        import random
+
+        self._sequence_id += 1
+        seq_id = str(self._sequence_id)
+
+        filament_entries = []
+        for p in profiles:
+            slot_id = p.get("slot_id", 0)
+            cali_idx = p.get("cali_idx")
+
+            if cali_idx is not None:
+                effective_cali_idx = cali_idx
+            else:
+                effective_cali_idx = -1 if slot_id == 0 else slot_id
+
+            setting_id = p.get("setting_id")
+            if not setting_id and slot_id == 0:
+                setting_id = f"PF{random.randint(10000000000000000, 99999999999999999)}"
+
+            filament_entries.append(
+                {
+                    "ams_id": 0,
+                    "cali_idx": effective_cali_idx,
+                    "extruder_id": p.get("extruder_id", 0),
+                    "filament_id": p.get("filament_id", ""),
+                    "k_value": p.get("k_value", "0.020000"),
+                    "n_coef": "0.000000",
+                    "name": p.get("name", ""),
+                    "nozzle_diameter": nozzle_diameter,
+                    "nozzle_id": p.get("nozzle_id", f"HS00-{nozzle_diameter}"),
+                    "setting_id": setting_id if setting_id else "",
+                    # See set_kprofile: -1 is rejected as "invalid tray_id" by
+                    # single-nozzle firmware even though the write lands (#2718).
+                    "tray_id": 0,
+                }
+            )
+
+        command = {
+            "print": {
+                "command": "extrusion_cali_set",
+                "filaments": filament_entries,
+                "nozzle_diameter": nozzle_diameter,
+                "sequence_id": seq_id,
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info("[%s] Setting %s K-profiles in batch", self.serial_number, len(filament_entries))
+        logger.debug("[%s] K-profile SET batch command: %s", self.serial_number, command_json)
+        self._publish_cali_write(command, seq_id)
+        return seq_id
+
+    def delete_kprofile(
+        self,
+        cali_idx: int,
+        filament_id: str,
+        nozzle_id: str,
+        nozzle_diameter: str = "0.4",
+        extruder_id: int = 0,
+        setting_id: str | None = None,
+    ) -> str | None:
+        """Delete a K-profile from the printer.
+
+        Args:
+            cali_idx: The calibration index (slot_id) of the profile to delete
+            filament_id: Bambu filament identifier
+            nozzle_id: Nozzle identifier (e.g., "HH00-0.4")
+            nozzle_diameter: Nozzle diameter (e.g., "0.4")
+            extruder_id: Extruder ID (0 or 1 for dual nozzle)
+            setting_id: Unique setting identifier (for X1C series)
+
+        Returns:
+            The sequence_id the command was sent under (see set_kprofile),
+            or None if it could not be sent.
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot delete K-profile: not connected", self.serial_number)
+            return None
+
+        self._sequence_id += 1
+        seq_id = str(self._sequence_id)
+
+        # Dual-nozzle K-profile delete uses the extruder_id/nozzle_id format;
+        # single-nozzle printers (X1C/P1/A1/P2S/H2S) need the setting_id form.
+        # Prefer runtime detection from device.extruder.info; fall back to
+        # model name. H2S is single-nozzle but shares serial prefix "094" with
+        # H2D, so a prefix-only check misclassified it (#1386).
+        from backend.app.utils.printer_models import is_dual_nozzle_model
+
+        is_dual_nozzle = self._is_dual_nozzle or is_dual_nozzle_model(self.model)
+
+        if is_dual_nozzle:
+            # H2D format: uses extruder_id, nozzle_id, nozzle_diameter
+            command = {
+                "print": {
+                    "command": "extrusion_cali_del",
+                    "sequence_id": seq_id,
+                    "extruder_id": extruder_id,
+                    "nozzle_id": nozzle_id,
+                    "filament_id": filament_id,
+                    "cali_idx": cali_idx,
+                    "nozzle_diameter": nozzle_diameter,
+                }
+            }
+        else:
+            # X1C/P1/A1 format: include all fields like the set command
+            # The delete command structure should match what set uses
+            command = {
+                "print": {
+                    "command": "extrusion_cali_del",
+                    "sequence_id": seq_id,
+                    "filament_id": filament_id,
+                    "cali_idx": cali_idx,
+                    "setting_id": setting_id if setting_id else "",
+                    "nozzle_diameter": nozzle_diameter,
+                    "nozzle_id": nozzle_id,
+                    "extruder_id": extruder_id,
+                }
+            }
+
+        command_json = json.dumps(command)
+        logger.info(
+            f"[{self.serial_number}] Deleting K-profile: cali_idx={cali_idx}, filament={filament_id}, setting_id={setting_id}, dual={is_dual_nozzle}"
+        )
+        logger.debug("[%s] K-profile DELETE command: %s", self.serial_number, command_json)
+        # QoS 1 for reliable delivery (at least once)
+        self._publish_cali_write(command, seq_id)
+        return seq_id
 
     # =========================================================================
     # Printer Control Commands
     # =========================================================================
 
+    def pause_print(self) -> bool:
+        """Pause the current print job."""
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot pause print: not connected", self.serial_number)
+            return False
 
+        command = {"print": {"command": "pause", "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Sent pause print command", self.serial_number)
+        return True
 
+    def resume_print(self) -> bool:
+        """Resume a paused print job."""
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot resume print: not connected", self.serial_number)
+            return False
 
+        command = {"print": {"command": "resume", "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Sent resume print command", self.serial_number)
+        return True
 
+    def clear_hms_errors(self) -> bool:
+        """Clear HMS/print errors on the printer and locally."""
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot clear HMS errors: not connected", self.serial_number)
+            return False
 
+        command = {"print": {"command": "clean_print_error", "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        self.state.hms_errors = []
+        logger.info("[%s] Sent clear HMS errors command", self.serial_number)
+        return True
 
+    def skip_objects(self, object_ids: list[int]) -> bool:
+        """Skip specific objects during a print.
 
+        This command tells the printer to skip printing the specified objects.
+        The object IDs come from the slice_info.config file in the 3MF.
 
+        Args:
+            object_ids: List of identify_id values from slice_info.config
 
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot skip objects: not connected", self.serial_number)
+            return False
 
+        if self.state.state != "RUNNING" and self.state.state != "PAUSE":
+            logger.warning(
+                f"[{self.serial_number}] Cannot skip objects: printer not printing (state={self.state.state})"
+            )
+            return False
 
+        if not object_ids:
+            logger.warning("[%s] Cannot skip objects: no object IDs provided", self.serial_number)
+            return False
 
+        # Validate all IDs are integers
+        try:
+            obj_list = [int(oid) for oid in object_ids]
+        except (ValueError, TypeError) as e:
+            logger.warning("[%s] Invalid object IDs: %s", self.serial_number, e)
+            return False
 
+        self._sequence_id += 1
+        command = {"print": {"sequence_id": str(self._sequence_id), "command": "skip_objects", "obj_list": obj_list}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Sent skip_objects command: %s", self.serial_number, obj_list)
 
+        # Track skipped objects in state
+        for oid in obj_list:
+            if oid not in self.state.skipped_objects:
+                self.state.skipped_objects.append(oid)
 
+        return True
 
+    def send_gcode(self, gcode: str) -> bool:
+        """Send G-code command(s) to the printer.
 
+        Multiple commands can be separated by newlines.
 
+        Args:
+            gcode: G-code command(s) to send
 
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot send G-code: not connected", self.serial_number)
+            return False
 
+        self._sequence_id += 1
+        command = {"print": {"command": "gcode_line", "param": gcode, "sequence_id": str(self._sequence_id)}}
+        # Use QoS 1 for reliable delivery (at least once)
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.debug("[%s] Sent G-code: %s...", self.serial_number, gcode[:50])
+        return True
 
+    def set_bed_temperature(self, target: int) -> bool:
+        """Set the bed target temperature.
 
+        Args:
+            target: Target temperature in Celsius (0 to turn off)
 
+        Returns:
+            True if command was sent, False otherwise
+        """
+        return self.send_gcode(f"M140 S{target}")
 
+    def set_nozzle_temperature(self, target: int, nozzle: int = 0) -> bool:
+        """Set the nozzle target temperature.
+
+        Args:
+            target: Target temperature in Celsius (0 to turn off)
+            nozzle: Nozzle index (0 for right/default, 1 for left on H2D)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        # Use M104 for non-blocking
+        # Always use T parameter for H2D compatibility
+        result = self.send_gcode(f"M104 T{nozzle} S{target}")
+        # H2D quirk: left nozzle (nozzle=1) target isn't reported in MQTT
+        # Track it locally so we can display it correctly
+        if result and nozzle == 1:
+            self.state.temperatures["nozzle_target"] = float(target)
+            self.state.temperatures["_nozzle_target_set_time"] = time.time()
+            logger.info("[%s] Tracking LEFT nozzle target locally: %s°C", self.serial_number, target)
+        return result
+
+    def set_chamber_temperature(self, target: int) -> bool:
+        """Set the chamber target temperature.
+
+        Args:
+            target: Target temperature in Celsius (0 to turn off heating)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        # M141 sets chamber temperature
+        result = self.send_gcode(f"M141 S{target}")
+        # Track chamber target locally (MQTT reports encoded values that need filtering)
+        if result:
+            self.state.temperatures["chamber_target"] = float(target)
+            self.state.temperatures["_chamber_target_set_time"] = time.time()
+            # Update heating state immediately based on new target
+            current_temp = self.state.temperatures.get("chamber", 0)
+            self.state.temperatures["chamber_heating"] = target > 0 and current_temp < target
+            logger.info(
+                f"[{self.serial_number}] Tracking chamber target locally: {target}°C (heating={self.state.temperatures['chamber_heating']})"
+            )
+        return result
+
+    def set_print_speed(self, mode: int) -> bool:
+        """Set the print speed mode.
+
+        Args:
+            mode: Speed mode (1=silent, 2=standard, 3=sport, 4=ludicrous)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set print speed: not connected", self.serial_number)
+            return False
+
+        if mode not in (1, 2, 3, 4):
+            logger.warning("[%s] Invalid speed mode: %s", self.serial_number, mode)
+            return False
+
+        command = {"print": {"command": "print_speed", "param": str(mode), "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Set print speed mode to %s", self.serial_number, mode)
+        return True
+
+    def set_fan_speed(self, fan: int, speed: int) -> bool:
+        """Set fan speed.
+
+        Args:
+            fan: Fan index (1=part cooling, 2=auxiliary, 3=chamber, 10=left auxiliary).
+                Index 10 is the optional left auxiliary part cooling fan on P2S/X2D
+                (airduct part id 10); Bambu's official machine profiles drive it with
+                "M106 P10" in start/layer-change gcode.
+            speed: Speed 0-255 (0=off, 255=full)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if fan not in (1, 2, 3, 10):
+            logger.warning("[%s] Invalid fan index: %s", self.serial_number, fan)
+            return False
+
+        speed = max(0, min(255, speed))  # Clamp to 0-255
+        return self.send_gcode(f"M106 P{fan} S{speed}")
+
+    def set_part_fan(self, speed: int) -> bool:
+        """Set part cooling fan speed (0-255)."""
+        return self.set_fan_speed(1, speed)
+
+    def set_aux_fan(self, speed: int) -> bool:
+        """Set auxiliary fan speed (0-255)."""
+        return self.set_fan_speed(2, speed)
+
+    def set_chamber_fan(self, speed: int) -> bool:
+        """Set chamber fan speed (0-255)."""
+        return self.set_fan_speed(3, speed)
+
+    def set_left_aux_fan(self, speed: int) -> bool:
+        """Set left auxiliary part cooling fan speed (0-255). P2S/X2D accessory."""
+        return self.set_fan_speed(10, speed)
+
+    def set_airduct_mode(self, mode: str) -> bool:
+        """Set air conditioning mode (cooling or heating).
+
+        Args:
+            mode: "cooling" (modeId=0) or "heating" (modeId=1)
+                - Cooling: Suitable for PLA/PETG/TPU, filters and cools chamber air
+                - Heating: Suitable for ABS/ASA/PC/PA, circulates and heats chamber air,
+                           closes top exhaust flap
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set airduct mode: not connected", self.serial_number)
+            return False
+
+        self._sequence_id += 1
+        mode_id = 0 if mode == "cooling" else 1
+        command = {
+            "print": {"command": "set_airduct", "modeId": mode_id, "sequence_id": str(self._sequence_id), "submode": -1}
+        }
+        # Use QoS 1 for reliable delivery
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info(
+            "[%s] Set airduct mode to %s (modeId=%s, seq=%s)", self.serial_number, mode, mode_id, self._sequence_id
+        )
+        return True
+
+    def set_chamber_light(self, on: bool) -> bool:
+        """Turn chamber light on or off.
+
+        Args:
+            on: True to turn on, False to turn off
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set chamber light: not connected", self.serial_number)
+            return False
+
+        mode = "on" if on else "off"
+        # Control both chamber lights (some printers like H2D have two)
+        for led_node in ["chamber_light", "chamber_light2"]:
+            self._sequence_id += 1
+            command = {
+                "system": {
+                    "command": "ledctrl",
+                    "led_node": led_node,
+                    "led_mode": mode,
+                    "led_on_time": 500,
+                    "led_off_time": 500,
+                    "loop_times": 0,
+                    "interval_time": 0,
+                    "sequence_id": str(self._sequence_id),
+                }
+            }
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Set chamber lights %s (seq=%s)", self.serial_number, "on" if on else "off", self._sequence_id)
+        return True
+
+    def select_extruder(self, extruder: int) -> bool:
+        """Select the active extruder for dual-nozzle printers (H2D).
+
+        Args:
+            extruder: Extruder index (0=right, 1=left for H2D)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if extruder not in (0, 1):
+            logger.warning("[%s] Invalid extruder: %s", self.serial_number, extruder)
+            return False
+
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot switch extruder: not connected", self.serial_number)
+            return False
+
+        # H2D extruder switching via select_extruder command
+        # Command format captured from OrcaSlicer:
+        # {"print": {"command": "select_extruder", "extruder_index": 0, "sequence_id": "..."}}
+        # extruder_index: 0 = RIGHT, 1 = LEFT
+        self._sequence_id += 1
+        command = {
+            "print": {"command": "select_extruder", "extruder_index": extruder, "sequence_id": str(self._sequence_id)}
+        }
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info(
+            "[%s] Sent select_extruder command: extruder_index=%s (0=right, 1=left)", self.serial_number, extruder
+        )
+        return True
+
+    def home_axes(self, axes: str = "XYZ") -> bool:
+        """Run the printer's full auto-home sequence.
+
+        The ``axes`` argument is ignored: a bare ``G28`` is always sent so
+        Bambu firmware runs its safe multi-step routine (park toolhead →
+        home XY → home Z). Partial-axis variants like ``G28 Z`` skip the
+        toolhead-park step and can crash the bed into the toolhead on H2C
+        / H2D / H2S / X1 where Z-home moves the bed UP — see #1052.
+        """
+        return self.send_gcode("G28")
+
+    def move_axis(self, axis: str, distance: float, speed: int = 3000) -> bool:
+        """Move an axis by a relative distance.
+
+        Args:
+            axis: Axis to move ("X", "Y", or "Z")
+            distance: Distance to move in mm (positive or negative)
+            speed: Movement speed in mm/min
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        axis = axis.upper()
+        if axis not in ("X", "Y", "Z"):
+            logger.warning("[%s] Invalid axis: %s", self.serial_number, axis)
+            return False
+
+        # G91 = relative mode, G0 = rapid move, G90 = back to absolute
+        gcode = f"G91\nG0 {axis}{distance:.2f} F{speed}\nG90"
+        return self.send_gcode(gcode)
+
+    def disable_motors(self) -> bool:
+        """Disable all stepper motors.
+
+        Warning: This will cause the printer to lose its position.
+        A homing operation will be required before printing.
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        return self.send_gcode("M18")
+
+    def enable_motors(self) -> bool:
+        """Enable all stepper motors.
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        return self.send_gcode("M17")
+
+    def ams_load_filament(self, tray_id: int, extruder_id: int | None = None) -> bool:
+        """Load filament from a specific AMS tray.
+
+        Args:
+            tray_id: Global tray ID — 0..15 for AMS slots, 254 for external spool
+                (single-external printers and Ext-L on dual-nozzle H2D),
+                255 for Ext-R on dual-nozzle H2D.
+            extruder_id: Which hotend to feed (0 = right/main, 1 = left/deputy).
+                Sent only when given, matching BambuStudio: ``extruder_id`` is
+                an optional field on ``ams_change_filament``
+                (``DeviceManager::command_ams_change_filament``) and Studio
+                omits it unless a Filament Track Switch is installed. Without a
+                switch the firmware derives the hotend from the AMS's own
+                extruder binding and an explicit value is redundant; *with* one
+                every AMS reports 0xE and is bound to a switch inlet instead, so
+                the firmware has nothing to derive from and the load silently
+                does nothing until we name the hotend.
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot load filament: not connected", self.serial_number)
+            return False
+
+        # Build the ams_change_filament command. Encoding differs by target type:
+        #   - AMS slots (0..15): slot_id is the local slot, curr/tar_temp = -1.
+        #   - External spool (tray_id=254): legacy capture from a single-extruder
+        #     printer used slot_id=254, curr/tar_temp=-1; preserved here.
+        #   - Ext-R on dual-nozzle H2D (tray_id=255): captured shape from
+        #     BambuStudio uses slot_id=0 (extruder index, 0=right), and
+        #     curr_temp/tar_temp = the actual right-nozzle temp.  See #891.
+        self._sequence_id += 1
+        wire_target = tray_id
+        if tray_id == 255:
+            ams_id = 255
+            slot_id = 0  # extruder index for the right nozzle
+            right_temp = int(self.state.temperatures.get("nozzle_2", 0) or 0)
+            if right_temp < 180:
+                right_temp = 215  # Reasonable default if right nozzle is cold/unknown
+            curr_temp = right_temp
+            tar_temp = right_temp
+        elif tray_id == 254:
+            ams_id = 255
+            slot_id = 254
+            curr_temp = -1
+            tar_temp = -1
+        elif (_a2l := a2l_lite_wire_ids(tray_id // 4, tray_id)) is not None:
+            # A2L AMS-Lite: physical unit 16 + local slot confirmed; the wire
+            # `target` (physical global 64-67) is extrapolated (no A2L load
+            # capture yet). See a2l_lite_wire_ids.
+            ams_id, slot_id, wire_target = _a2l
+            curr_temp = -1
+            tar_temp = -1
+        else:
+            ams_id = tray_id // 4
+            slot_id = tray_id % 4
+            curr_temp = -1
+            tar_temp = -1
+
+        command = {
+            "print": {
+                "command": "ams_change_filament",
+                "sequence_id": str(self._sequence_id),
+                "ams_id": ams_id,
+                "slot_id": slot_id,
+                "target": wire_target,
+                "curr_temp": curr_temp,
+                "tar_temp": tar_temp,
+            }
+        }
+        if extruder_id is not None:
+            command["print"]["extruder_id"] = int(extruder_id)
+
+        command_json = json.dumps(command)
+        logger.info("[%s] Publishing ams_change_filament command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        logger.info("[%s] Loading filament from tray %s (AMS %s slot %s)", self.serial_number, tray_id, ams_id, slot_id)
+
+        # Track this load request for H2D dual-nozzle disambiguation
+        # H2D reports only slot number (0-3) in tray_now, so we use our tracked value
+        self._last_load_tray_id = tray_id
+        self.state.pending_tray_target = tray_id
+        logger.info("[%s] Set pending_tray_target=%s for H2D disambiguation", self.serial_number, tray_id)
+
+        return True
+
+    def ams_unload_filament(self, tray_id: int | None = None) -> bool:
+        """Unload filament, optionally naming the slot to unload.
+
+        Args:
+            tray_id: Global tray ID of the slot being unloaded. When given, the
+                command is addressed to that slot's AMS and is only sent if an
+                extruder is actually fed from it — BambuStudio does the same
+                (``StatusPanel::on_ams_unload`` walks the extruders and sends
+                nothing when none matches). When omitted, the pre-existing
+                behaviour is kept: unload whatever ``tray_now`` names.
+
+        ``tray_now`` is a single value for the whole printer, so on a dual-nozzle
+        machine with both hotends loaded it names only one of them and an
+        unaddressed unload picks that one regardless of which slot the operator
+        clicked. Passing the slot is what makes the two hotends distinguishable.
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot unload filament: not connected", self.serial_number)
+            return False
+
+        # Get the currently loaded tray info
+        tray_now = self.state.tray_now
+        source_tray = tray_now if tray_id is None else tray_id
+        logger.info("[%s] Unload requested, tray_now=%s, tray_id=%s", self.serial_number, tray_now, tray_id)
+
+        # Determine source ams_id for the unload command
+        if source_tray == 255 or source_tray == 254:
+            ams_id = 255  # No filament or external spool
+        elif (_a2l := a2l_lite_wire_ids(source_tray // 4, source_tray)) is not None:
+            ams_id = _a2l[0]  # A2L AMS-Lite: normalised 6 -> physical 16
+        else:
+            ams_id = source_tray // 4  # Source AMS
+
+        # Refuse an addressed unload of a slot no hotend is holding — but only on
+        # a printer that has more than one hotend, which is the only case the
+        # check exists for. With one hotend there is nothing to disambiguate:
+        # tray_now already names the loaded slot exactly, and running the check
+        # anyway would stake unload on `snow` meaning ams*4+slot there too. It
+        # very likely does, but single-nozzle machines do report the block —
+        # BambuStudio has a dedicated branch for `m_total_extder_count == 1` and
+        # an X1C on the maintainer's own network sends `device.extruder` — and
+        # nobody has read a single-nozzle `snow` off the wire. Guessing wrong
+        # would 409 every unload on every X1C, P1S and A1.
+        #
+        # Gated on the runtime flag rather than on len(extruder_slots), which is
+        # rebuilt from each payload's array and would flip the check off for any
+        # frame that carried a short one; and deliberately not on
+        # ``is_dual_nozzle_model``, whose model-name fallback reports at least
+        # one single-nozzle machine as dual (#1386) — the false positive there is
+        # exactly the case this gate exists to keep out.
+        #
+        # The external spool is excluded for a different reason: 254/255 are not
+        # ams*4+slot, so the local-slot arithmetic below cannot describe them.
+        if tray_id is not None and tray_id not in (254, 255) and self._is_dual_nozzle and self.state.extruder_slots:
+            local_slot = _a2l[1] if (_a2l := a2l_lite_wire_ids(tray_id // 4, tray_id)) is not None else tray_id % 4
+            holder = next(
+                (ext for ext, slot in self.state.extruder_slots.items() if slot.holds(ams_id, local_slot)),
+                None,
+            )
+            if holder is None:
+                logger.info(
+                    "[%s] Unload skipped: no extruder is fed from AMS %s slot %s",
+                    self.serial_number,
+                    ams_id,
+                    local_slot,
+                )
+                return False
+            logger.info(
+                "[%s] Unloading AMS %s slot %s from extruder %s", self.serial_number, ams_id, local_slot, holder
+            )
+
+        # Command format from BambuStudio traffic capture:
+        # - No extruder_id field
+        # - For UNLOAD: curr_temp and tar_temp are the actual nozzle temp (e.g., 210)
+        # - slot_id=255 and target=255 for unload
+        # Get current nozzle temperature for the unload command
+        nozzle_temp = int(self.state.temperatures.get("nozzle", 210))
+        if nozzle_temp < 180:
+            nozzle_temp = 210  # Default to PLA temp if nozzle is cold
+
+        self._sequence_id += 1
+        command = {
+            "print": {
+                "command": "ams_change_filament",
+                "sequence_id": str(self._sequence_id),
+                "ams_id": ams_id,
+                "slot_id": 255,  # 255 = unload marker
+                "target": 255,  # 255 = unload destination
+                "curr_temp": nozzle_temp,
+                "tar_temp": nozzle_temp,
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info("[%s] Publishing ams_change_filament (unload) command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        logger.info("[%s] Unloading filament (tray_now was %s)", self.serial_number, tray_now)
+
+        # Clear tracked load request since we're unloading
+        self._last_load_tray_id = None
+        self.state.pending_tray_target = None
+        logger.info("[%s] Cleared pending_tray_target (unload)", self.serial_number)
+
+        return True
+
+    def ams_control(self, action: str) -> bool:
+        """Control AMS operations.
+
+        Args:
+            action: "resume", "reset", or "pause"
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot control AMS: not connected", self.serial_number)
+            return False
+
+        if action not in ("resume", "reset", "pause"):
+            logger.warning("[%s] Invalid AMS action: %s", self.serial_number, action)
+            return False
+
+        command = {"print": {"command": "ams_control", "param": action, "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] AMS control: %s", self.serial_number, action)
+        return True
+
+    async def ams_refresh_tray(self, ams_id: int, tray_id: int) -> tuple[bool, str]:
+        """Trigger RFID re-read for a specific AMS tray.
+
+        Sends ``ams_get_rfid`` and waits for the printer's answer. Firmware
+        that refuses it (#3206: X1Plus on base 01.08.02.00 answers ``FAIL`` /
+        ``ERROR STATE``) gets the legacy ``M620 R<global tray>`` gcode instead,
+        which is what Bambu Studio sends to printers without the new protocol.
+        The fallback only follows an explicit refusal, so firmware that takes
+        ``ams_get_rfid`` never sees it.
+
+        Success means the printer accepted the request, not that the tag was
+        read: the slot updating in the next push is the only proof of that.
+
+        Args:
+            ams_id: AMS unit ID (0-3, or 128 for H2D external tray)
+            tray_id: Tray ID within the AMS (0-3)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot refresh AMS tray: not connected", self.serial_number)
+            return False, "Printer not connected"
+
+        # Check if filament is currently loaded (tray_now != 255)
+        # RFID refresh requires the AMS to move filament, which can't happen if one is loaded
+        tray_now = self.state.tray_now
+        if tray_now != 255:
+            # Decode which tray is loaded for the message
+            if tray_now == 254:
+                loaded_tray = "external spool"
+            elif tray_now >= 0 and tray_now < 128:
+                loaded_ams = tray_now // 4
+                loaded_slot = tray_now % 4
+                loaded_tray = f"AMS {loaded_ams + 1} slot {loaded_slot + 1}"
+            else:
+                loaded_tray = f"tray {tray_now}"
+            logger.warning("[%s] Cannot refresh AMS tray: filament loaded from %s", self.serial_number, loaded_tray)
+            return False, f"Please unload filament first. Currently loaded: {loaded_tray}"
+
+        # A2L AMS-Lite: physical unit 16 + local slot (matches ams_mapping2).
+        wire_ams_id, wire_slot_id = ams_id, tray_id
+        if (_a2l := a2l_lite_wire_ids(ams_id, tray_id)) is not None:
+            wire_ams_id, wire_slot_id, _ = _a2l
+
+        logger.info("[%s] Triggering RFID re-read: AMS %s, slot %s", self.serial_number, ams_id, tray_id)
+        refused = await self._send_rfid_command(
+            {"command": "ams_get_rfid", "ams_id": wire_ams_id, "slot_id": wire_slot_id}
+        )
+        if refused is None:
+            return True, f"Refreshing AMS {ams_id} tray {tray_id}"
+
+        # M620 R only for what Bambu Studio sends it to: a model older than the
+        # newer protocol, on one of the four regular AMS units (the only ones
+        # with a legacy global tray index). Never during a job either: a
+        # gcode_line would be executed inside the running print.
+        from backend.app.utils.printer_models import uses_legacy_rfid_refresh
+
+        if (
+            not 0 <= wire_ams_id <= 3
+            or not uses_legacy_rfid_refresh(self.model)
+            or self.state.state in _ACTIVE_PRINT_STATES
+        ):
+            return False, f"Printer refused the RFID refresh: {refused}"
+
+        logger.info(
+            "[%s] ams_get_rfid refused (%s), falling back to M620 R%s",
+            self.serial_number,
+            refused,
+            wire_ams_id * 4 + wire_slot_id,
+        )
+        legacy_refused = await self._send_rfid_command(
+            {"command": "gcode_line", "param": f"M620 R{wire_ams_id * 4 + wire_slot_id}\n"}
+        )
+        if legacy_refused is None:
+            return True, f"Refreshing AMS {ams_id} tray {tray_id} (legacy command)"
+        return False, f"Printer refused the RFID refresh: {legacy_refused}"
 
     # The answer to ams_get_rfid was measured at 11ms in #3206's capture.
     _rfid_ack_timeout: float = 3.0
 
+    async def _send_rfid_command(self, print_command: dict) -> str | None:
+        """Publish one RFID refresh command and wait for the printer's answer.
 
+        Returns the printer's reason when it answered ``FAIL``, else None.
+        No answer within ``_rfid_ack_timeout`` counts as accepted, because
+        silence is not evidence of refusal and older firmware may not answer
+        at all.
+        """
+        timeout = self._rfid_ack_timeout
+        self._sequence_id += 1
+        seq_id = str(self._sequence_id)
+        command = {"print": {**print_command, "sequence_id": seq_id}}
+        self._pending_rfid_acks[seq_id] = None
+        try:
+            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                ack = self._pending_rfid_acks.get(seq_id)
+                if ack is not None:
+                    if str(ack.get("result", "")).lower() == "fail":
+                        return str(ack.get("reason", "") or "") or "printer reported failure"
+                    return None
+                await asyncio.sleep(0.05)
+        finally:
+            self._pending_rfid_acks.pop(seq_id, None)
+        logger.info(
+            "[%s] No answer to %s seq=%s within %.1fs", self.serial_number, print_command["command"], seq_id, timeout
+        )
+        return None
 
+    def ams_set_filament_setting(
+        self,
+        ams_id: int,
+        tray_id: int,
+        tray_info_idx: str,
+        tray_type: str,
+        tray_sub_brands: str,
+        tray_color: str,
+        nozzle_temp_min: int,
+        nozzle_temp_max: int,
+        setting_id: str = "",
+    ) -> bool:
+        """Set AMS tray filament settings (type, color, temperature).
 
+        Note: K value is set separately via extrusion_cali_sel command.
 
+        Args:
+            ams_id: AMS unit ID (0-3 for regular AMS, 128-135 for HT AMS)
+            tray_id: Tray ID within the AMS (0-3)
+            tray_info_idx: Filament ID short format (e.g., "GFL05")
+            tray_type: Filament type (e.g., "PLA", "PETG")
+            tray_sub_brands: Sub-brand name (e.g., "PLA Basic", "PETG HF")
+            tray_color: Color in RRGGBBAA hex format (e.g., "FFFF00FF")
+            nozzle_temp_min: Minimum nozzle temperature
+            nozzle_temp_max: Maximum nozzle temperature
+            setting_id: Full setting ID with version (e.g., "GFSL05_07") - optional
 
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set AMS filament setting: not connected", self.serial_number)
+            return False
 
-
-
-    def _publish_read_request(self, message: dict) -> None:
-        """Only two exact, non-actuating telemetry requests may leave this client."""
-        if message == {"pushing": {"command": "pushall"}}:
-            pass
-        elif (set(message) == {"info"} and isinstance(message["info"], dict)
-              and set(message["info"]) == {"command", "sequence_id"}
-              and message["info"]["command"] == "get_version"
-              and isinstance(message["info"]["sequence_id"], str)
-              and message["info"]["sequence_id"].isdigit()):
-            pass
+        # Calculate mqtt IDs based on AMS type.
+        # External-spool convention verified against a BambuStudio→X1C packet capture
+        # (issue #1279, May 2026): for `ams_filament_setting` Studio sends the
+        # *global* tray index in `tray_id`, not a local position within the virtual
+        # unit. The printer's response echoes `tray_id: 0` (slot position), which
+        # is what the original code was matching — but the request and response
+        # use different semantics for that field. Sending `tray_id: 0` is what
+        # the P1S in #1279 rejected with `result: "fail"`.
+        if ams_id == 255:
+            vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
+            if len(vt_tray) > 1:
+                # Dual external slots (H2D): each ext slot is its own virtual AMS unit
+                # (254=ext-L / slot 0, 255=ext-R / slot 1). The dual case is NOT
+                # covered by the X1C capture — left at `mqtt_tray_id = 0` until a
+                # captured Studio→H2D exchange confirms the correct value.
+                mqtt_ams_id = 254 + tray_id
+                mqtt_tray_id = 0
+            else:
+                # Single external slot (X1C, P1S, A1): global tray_id=254.
+                mqtt_ams_id = 255
+                mqtt_tray_id = 254
+            slot_id = 0
+        elif (_a2l := a2l_lite_wire_ids(ams_id, tray_id)) is not None:
+            # A2L AMS-Lite: physical unit 16, local 0-3 slot (matches the
+            # firmware's own ams_mapping2 {ams_id:16, slot_id:0-3}).
+            mqtt_ams_id, slot_id, _ = _a2l
+            mqtt_tray_id = slot_id
+        elif ams_id <= 3:
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = tray_id
         else:
-            raise ValueError("Monitoring-only client refuses printer control commands")
-        if self._client:
-            self._client.publish(self.topic_publish, json.dumps(message), qos=1)
+            # AMS-HT: single tray per unit
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = 0
+
+        command = {
+            "print": {
+                "command": "ams_filament_setting",
+                "ams_id": mqtt_ams_id,
+                "tray_id": mqtt_tray_id,
+                "slot_id": slot_id,
+                "tray_info_idx": tray_info_idx,
+                "tray_type": tray_type,
+                "tray_sub_brands": tray_sub_brands,
+                # UPPERCASE, always: lowercase hex is silently read as zeros by
+                # P1S firmware and acknowledged as a success (#2987).
+                "tray_color": wire_tray_color(tray_color),
+                "nozzle_temp_min": nozzle_temp_min,
+                "nozzle_temp_max": nozzle_temp_max,
+                "sequence_id": "0",
+            }
+        }
+
+        # Include setting_id if provided (helps slicer show correct profile)
+        if setting_id:
+            command["print"]["setting_id"] = setting_id
+
+        command_json = json.dumps(command)
+        logger.info(
+            f"[{self.serial_number}] Publishing ams_filament_setting: AMS {ams_id}, tray {tray_id}, tray_info_idx={tray_info_idx}, setting_id={setting_id}"
+        )
+        logger.debug("[%s] ams_filament_setting command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        self._last_ams_cmd_time = time.monotonic()
+        return True
+
+    def reset_ams_slot(self, ams_id: int, tray_id: int) -> bool:
+        """Reset an AMS slot to empty/unconfigured state.
+
+        Args:
+            ams_id: AMS unit ID (0-3 for regular AMS, 128-135 for HT AMS)
+            tray_id: Tray ID within the AMS (0-3)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot reset AMS slot: not connected", self.serial_number)
+            return False
+
+        # Calculate mqtt IDs based on AMS type — same convention as
+        # ams_set_filament_setting above. See its comment for the #1279 capture rationale.
+        if ams_id == 255:
+            vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
+            if len(vt_tray) > 1:
+                # Dual external slots (H2D): each ext slot is its own virtual AMS unit
+                mqtt_ams_id = 254 + tray_id
+                mqtt_tray_id = 0
+            else:
+                # Single external slot (X1C, P1S, A1): global tray_id=254.
+                mqtt_ams_id = 255
+                mqtt_tray_id = 254
+            slot_id = 0
+        elif (_a2l := a2l_lite_wire_ids(ams_id, tray_id)) is not None:
+            # A2L AMS-Lite: physical unit 16, local 0-3 slot (matches ams_mapping2).
+            mqtt_ams_id, slot_id, _ = _a2l
+            mqtt_tray_id = slot_id
+        elif ams_id <= 3:
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = tray_id
+        else:
+            # AMS-HT: single tray per unit
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = 0
+
+        command = {
+            "print": {
+                "command": "ams_filament_setting",
+                "ams_id": mqtt_ams_id,
+                "tray_id": mqtt_tray_id,
+                "slot_id": slot_id,
+                "tray_info_idx": "",
+                "tray_type": "",
+                "tray_sub_brands": "",
+                "tray_color": "00000000",
+                "nozzle_temp_min": 0,
+                "nozzle_temp_max": 0,
+                "sequence_id": "0",
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info("[%s] Resetting AMS slot: AMS %s, tray %s", self.serial_number, ams_id, tray_id)
+        logger.debug("[%s] reset_ams_slot command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        self._last_ams_cmd_time = time.monotonic()
+        return True
+
+    def extrusion_cali_sel(
+        self,
+        ams_id: int,
+        tray_id: int,
+        cali_idx: int,
+        filament_id: str,
+        nozzle_diameter: str = "0.4",
+    ) -> bool:
+        """Set calibration profile (K value) for an AMS slot.
+
+        This command selects a K profile from the printer's calibration list.
+        Use cali_idx=-1 to use the default K value (0.020).
+
+        Note: Do NOT send setting_id in this command — BambuStudio never includes
+        it, and adding it causes the firmware to mislink the profile on X1C/P1S.
+
+        Args:
+            ams_id: AMS unit ID (0-3 for regular AMS, 128-135 for HT AMS)
+            tray_id: Tray ID within the AMS (0-3)
+            cali_idx: Calibration profile index (-1 for default)
+            filament_id: Filament preset ID (same as tray_info_idx)
+            nozzle_diameter: Nozzle diameter string (e.g., "0.4")
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set calibration: not connected", self.serial_number)
+            return False
+
+        # Calculate mqtt IDs based on AMS type.
+        # IMPORTANT: extrusion_cali_sel uses GLOBAL tray_id (unlike ams_filament_setting
+        # which uses LOCAL).  BambuStudio confirms: tray_id = ams_id * 4 + slot.
+        if ams_id == 255:
+            # External spool: extrusion_cali_sel uses GLOBAL tray_id (unlike
+            # ams_filament_setting which uses LOCAL tray_id=0).
+            vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
+            if len(vt_tray) > 1:
+                # Dual external slots (H2D): each ext slot is its own virtual AMS unit
+                # Confirmed from BambuStudio logs: ext-R sends ams_id=255, tray_id=255
+                mqtt_ams_id = 254 + tray_id
+                mqtt_tray_id = 254 + tray_id
+            else:
+                # Single external slot (X1C, P1S, A1): global tray_id=254
+                mqtt_ams_id = 254
+                mqtt_tray_id = 254
+            slot_id = 0
+        elif ams_id <= 3:
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = ams_id * 4 + tray_id
+            slot_id = tray_id
+        elif (_a2l := a2l_lite_wire_ids(ams_id, tray_id)) is not None:
+            # A2L AMS-Lite: physical unit 16 + local slot are confirmed; the GLOBAL
+            # tray_id this command wants (physical 16*4+slot) is extrapolated (no
+            # A2L cali_sel capture yet) — see a2l_lite_wire_ids.
+            mqtt_ams_id, slot_id, mqtt_tray_id = _a2l
+        elif ams_id >= 128 and ams_id <= 135:
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = 0
+        else:
+            mqtt_ams_id = ams_id
+            mqtt_tray_id = tray_id
+            slot_id = 0
+
+        command = {
+            "print": {
+                "command": "extrusion_cali_sel",
+                "cali_idx": cali_idx,
+                "filament_id": filament_id,
+                "nozzle_diameter": nozzle_diameter,
+                "ams_id": mqtt_ams_id,
+                "tray_id": mqtt_tray_id,
+                "slot_id": slot_id,
+                "sequence_id": "0",
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info(
+            f"[{self.serial_number}] Publishing extrusion_cali_sel: AMS {ams_id}, tray {tray_id}, cali_idx={cali_idx}"
+        )
+        logger.debug("[%s] extrusion_cali_sel command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        return True
+
+    def extrusion_cali_set(
+        self,
+        tray_id: int,
+        k_value: float,
+        nozzle_diameter: str = "0.4",
+        nozzle_temp: int = 220,
+        filament_id: str = "",
+        setting_id: str = "",
+        name: str = "",
+        cali_idx: int = -1,
+    ) -> bool:
+        """Directly set K value (pressure advance) for a tray.
+
+        Uses the filaments array format required by current firmware.
+
+        Args:
+            tray_id: Global tray ID (ams_id * 4 + slot)
+            k_value: Pressure advance K value (e.g., 0.020)
+            nozzle_diameter: Nozzle diameter string (e.g., "0.4")
+            nozzle_temp: Nozzle temperature for calibration reference
+            filament_id: Filament preset ID (e.g., "GFA02")
+            setting_id: Setting ID (e.g., "GFSA02_07")
+            name: Profile display name
+            cali_idx: Calibration index (-1 for new)
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set K value: not connected", self.serial_number)
+            return False
+
+        # Was reusing the previous command's id — harmless while nothing
+        # correlated on it, but the printer echoes sequence_id back and the
+        # K-profile write path now matches acks by it (#2718).
+        self._sequence_id += 1
+
+        nozzle_id = f"HS00-{nozzle_diameter}"
+
+        # A2L AMS-Lite: a normalised global tray (24-27) must go out as the
+        # physical global (extrapolated 64-67; see a2l_lite_wire_ids). ams_id
+        # stays 0 (hardcoded, as for every other unit here).
+        wire_tray_id = tray_id
+        if 0 <= tray_id <= 253 and (_a2l := a2l_lite_wire_ids(tray_id // 4, tray_id)) is not None:
+            wire_tray_id = _a2l[2]
+
+        filament_entry = {
+            "ams_id": 0,
+            "cali_idx": cali_idx,
+            "extruder_id": 0,
+            "filament_id": filament_id,
+            "k_value": f"{k_value:.6f}",
+            "n_coef": "1.400000",
+            "name": name,
+            "nozzle_diameter": nozzle_diameter,
+            "nozzle_id": nozzle_id,
+            "setting_id": setting_id,
+            "tray_id": wire_tray_id,
+        }
+
+        command = {
+            "print": {
+                "command": "extrusion_cali_set",
+                "filaments": [filament_entry],
+                "nozzle_diameter": nozzle_diameter,
+                "sequence_id": str(self._sequence_id),
+            }
+        }
+
+        command_json = json.dumps(command)
+        logger.info("[%s] Publishing extrusion_cali_set: tray %s, k_value=%s", self.serial_number, tray_id, k_value)
+        logger.debug("[%s] extrusion_cali_set command: %s", self.serial_number, command_json)
+        self._client.publish(self.topic_publish, command_json, qos=1)
+        return True
+
+    def set_timelapse(self, enable: bool) -> bool:
+        """Enable or disable timelapse recording.
+
+        Args:
+            enable: True to enable, False to disable
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set timelapse: not connected", self.serial_number)
+            return False
+
+        command = {"pushing": {"command": "pushall", "sequence_id": "0"}}
+        # First send the timelapse setting
+        timelapse_cmd = {
+            "print": {"command": "gcode_line", "param": f"M981 S{1 if enable else 0} P20000", "sequence_id": "0"}
+        }
+        self._client.publish(self.topic_publish, json.dumps(timelapse_cmd), qos=1)
+        # Request status update
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        logger.info("[%s] Set timelapse %s", self.serial_number, "enabled" if enable else "disabled")
+        return True
+
+    def set_liveview(self, enable: bool) -> bool:
+        """Enable or disable live view / camera streaming.
+
+        Args:
+            enable: True to enable, False to disable
+
+        Returns:
+            True if command was sent, False otherwise
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot set liveview: not connected", self.serial_number)
+            return False
+
+        command = {
+            "xcam": {"command": "ipcam_record_set", "control": "enable" if enable else "disable", "sequence_id": "0"}
+        }
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        # Request status update
+        pushall = {"pushing": {"command": "pushall", "sequence_id": "0"}}
+        self._client.publish(self.topic_publish, json.dumps(pushall), qos=1)
+        logger.info("[%s] Set liveview %s", self.serial_number, "enabled" if enable else "disabled")
+        return True
+
+    def execute_hms_action(self, print_error: str, action: str, job_id: str | None = None) -> bool:
+        """Dispatch the user's choice from the HMS-error modal as a printer command.
+
+        Args:
+            print_error: Canonical hex identifier for the fault — 8 chars for the
+                32-bit `print_error` path, 16 chars for the 64-bit `hms[]` path
+                (HMSError.full_code). Carried through unchanged from the route.
+                Converted to its DECIMAL string form for the `ignore` /
+                `idle_ignore` commands' `err` field, which is what the firmware
+                actually compares against the active fault. The pre-#1869
+                hex-string `err` was silently rejected because the firmware was
+                being asked to match `"05008051"` against int 0x05008051
+                (= 83918929 decimal) — see BambuStudio's
+                DeviceManager.cpp:1450-1462 (`command_hms_ignore`) which passes
+                `std::to_string(int m_error_code)`.
+            action: One of HMSAction's string values.
+            job_id: The `subtask_id` snapshotted onto the HMSError at parse-time.
+                Required by BambuStudio's `command_hms_ignore` / `command_hms_stop`
+                shapes; empty string is the no-job-id sentinel.
+
+        Returns False when the MQTT client is offline or when `action` is unknown
+        so the route surfaces it as a 4xx rather than a silent no-op.
+        """
+
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot execute HMS action: not connected", self.serial_number)
+            return False
+
+        # Always re-push the full state after a command so the modal's underlying
+        # status query reflects the new error list (or absence) on the next tick.
+        def publish(payload: dict):
+            self._client.publish(self.topic_publish, json.dumps(payload), qos=1)
+            self._client.publish(
+                self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
+            )
+
+        # BambuStudio's `err` field is the DECIMAL string of the error code's int
+        # value (DeviceErrorDialog.cpp passes `std::to_string(m_error_code)` to
+        # every command_hms_* call). Our route hands us the hex string —
+        # convert. Falls back to the raw input if it's not parseable so the
+        # firmware can reject it and the route can surface 502 instead of us
+        # raising ValueError mid-dispatch.
+        try:
+            err_decimal = str(int(print_error, 16))
+        except ValueError:
+            err_decimal = print_error
+
+        def hms_resume():
+            # Plain resume — verified against the user's H2D/H2S to leave PAUSE
+            # cleanly when "Problem Solved and Resume" is clicked. BambuStudio
+            # sends `{command: "resume", err: "<decimal>", param: "reserve",
+            # job_id: ...}` from `command_hms_resume`; we kept the simpler
+            # shape historically because it works, and changing it without a
+            # field test risks regressing a path that the user has confirmed.
+            publish(
+                {
+                    "print": {
+                        "command": "resume",
+                        "param": "",
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def hms_stop():
+            # Same as hms_resume — plain shape, confirmed working by the user
+            # for "Stop Printing".
+            publish(
+                {
+                    "print": {
+                        "command": "stop",
+                        "param": "",
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def hms_ignore_command():
+            # BambuStudio's `command_hms_ignore` (DeviceManager.cpp:1450) —
+            # what the "Ignore this and Resume" button actually publishes.
+            # Distinct from `idle_ignore`: this command has the firmware
+            # suppress the next re-check of the named fault AND resume the
+            # paused print in a single operation. The previous Bambuddy code
+            # redirected IGNORE_RESUME to a plain `resume`, which is why the
+            # wrong-plate HMS came back 1-2 s later: `resume` means "I fixed
+            # the problem, re-check normally" so the firmware re-detected the
+            # wrong plate and re-paused with the same code (#1869).
+            #
+            # BambuStudio also routes IGNORE_NO_REMINDER_NEXT_TIME (a.k.a.
+            # DONT_REMIND_NEXT_TIME) to this same command — the persistent
+            # variant of "don't remind next time" lives on `idle_ignore`'s
+            # type=1, not as a separate ignore shape.
+            publish(
+                {
+                    "print": {
+                        "command": "ignore",
+                        "err": err_decimal,
+                        "param": "reserve",
+                        "job_id": job_id or "",
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def hms_idle_ignore(persistent: bool = False):
+            # `idle_ignore` is BambuStudio's "dismiss this warning without
+            # resuming" command for non-pause warnings — what
+            # `command_hms_idle_ignore` (DeviceManager.cpp:1424) sends.
+            # type=0 dismisses once, type=1 suppresses the same warning
+            # permanently. Used by NO_REMINDER_NEXT_TIME, which BambuStudio
+            # explicitly dispatches via `command_hms_idle_ignore(..., 0)` —
+            # NOT via the resume-bearing `ignore` command.
+            publish(
+                {
+                    "print": {
+                        "command": "idle_ignore",
+                        "err": err_decimal,
+                        "type": 1 if persistent else 0,
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def ams_control(param: str):
+            publish(
+                {
+                    "print": {
+                        "command": "ams_control",
+                        "param": param,
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def clean_print_error():
+            # Matches the existing `clear_hms_errors` shape — Bambu does not
+            # expect `print_error` in the body; the command clears whatever
+            # error dialog is currently active on the printer.
+            publish(
+                {
+                    "print": {
+                        "command": "clean_print_error",
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        def uiop_close():
+            # `err` is the 8-char hex short code (already a string from the
+            # frontend), uppercased for consistency with how BambuStudio sends it.
+            publish(
+                {
+                    "system": {
+                        "command": "uiop",
+                        "name": "print_error",
+                        "action": "close",
+                        "source": 1,
+                        "type": "dialog",
+                        "err": print_error.upper(),
+                        "sequence_id": "0",
+                    }
+                }
+            )
+
+        match action:
+            case (
+                HMSAction.RESUME_PRINTING
+                | HMSAction.RESUME_PRINTING_DEFECTS
+                | HMSAction.RESUME_PRINTING_PROBELM_SOLVED
+                | HMSAction.PROBLEM_SOLVED_RESUME
+                | HMSAction.FILAMENT_LOAD_RESUME
+                | HMSAction.PROCEED
+            ):
+                hms_resume()
+
+            case HMSAction.STOP_PRINTING:
+                hms_stop()
+
+            case HMSAction.IGNORE_RESUME | HMSAction.IGNORE_NO_REMINDER_NEXT_TIME | HMSAction.DONT_REMIND_NEXT_TIME:
+                # All three buttons map to BambuStudio's `command_hms_ignore`
+                # (DeviceErrorDialog.cpp:596-602). The "no reminder next time"
+                # half of IGNORE_NO_REMINDER_NEXT_TIME is the firmware's
+                # responsibility — the wire shape is identical.
+                hms_ignore_command()
+
+            case HMSAction.NO_REMINDER_NEXT_TIME:
+                # BambuStudio's NO_REMINDER_NEXT_TIME branch dispatches
+                # `command_hms_idle_ignore` with type=0
+                # (DeviceErrorDialog.cpp:588-590). Distinct from the
+                # IGNORE_* buttons above: idle_ignore does NOT resume, only
+                # dismisses the dialog.
+                hms_idle_ignore(persistent=False)
+
+            case HMSAction.FILAMENT_EXTRUDED | HMSAction.DBL_CHECK_DONE:
+                ams_control("done")
+
+            case (
+                HMSAction.RETRY_FILAMENT_EXTRUDED
+                | HMSAction.CONTINUE
+                | HMSAction.RETRY_PROBLEM_SOLVED
+                | HMSAction.DBL_CHECK_RETRY
+            ):
+                ams_control("resume")
+
+            case HMSAction.ABORT:
+                ams_control("abort")
+
+            case HMSAction.OK_BUTTON:
+                clean_print_error()
+
+            case HMSAction.DBL_CHECK_OK:
+                clean_print_error()
+                uiop_close()
+
+            case HMSAction.DBL_CHECK_RESUME:
+                # Plain resume — not HMS-aware, no err/job_id.
+                publish(
+                    {
+                        "print": {
+                            "command": "resume",
+                            "param": "",
+                            "sequence_id": "0",
+                        }
+                    }
+                )
+
+            case HMSAction.REFRESH_NOZZLE:
+                publish({"print": {"command": "refresh_nozzle", "sequence_id": "0"}})
+
+            case HMSAction.TURN_OFF_FIRE_ALARM:
+                publish({"print": {"command": "buzzer_ctrl", "mode": 0, "sequence_id": "0"}})
+
+            case HMSAction.STOP_DRYING:
+                publish({"print": {"command": "auto_stop_ams_dry", "sequence_id": "0"}})
+
+            case HMSAction.DISABLE_PURIFICATION:
+                publish({"print": {"command": "close_air_filt", "sequence_id": "0"}})
+
+            case (
+                HMSAction.CHECK_ASSISTANT
+                | HMSAction.JUMP_TO_LIVEVIEW
+                | HMSAction.OK_JUMP_RACK
+                | HMSAction.REMOVE_CLOSE_BTN
+                | HMSAction.LOAD_VIRTUAL_TRAY
+                | HMSAction.CANCLE
+                | HMSAction.DBL_CHECK_CANCEL
+            ):
+                # UI-only actions — the printer's own screen handles these; the
+                # modal still surfaces them so the user has parity with Studio.
+                pass
+
+            case _:
+                logger.warning("[%s] Unknown HMS action '%s'", self.serial_number, action)
+                return False
+
+        return True

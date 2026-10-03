@@ -24,9 +24,6 @@
 
 set -eu
 
-echo "[entrypoint] Starting Bambuddy Monitor"
-
-
 # Default to 1000:1000 to match the legacy `user: "1000:1000"` default
 # in our previously-shipped compose template; overridable via env so
 # users who run docker as a different uid can match their host without

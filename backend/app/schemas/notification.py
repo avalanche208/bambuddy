@@ -1,0 +1,436 @@
+"""Pydantic schemas for notification providers."""
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from backend.app.core.compat import StrEnum
+
+
+class ProviderType(StrEnum):
+    """Supported notification provider types."""
+
+    CALLMEBOT = "callmebot"
+    NTFY = "ntfy"
+    PUSHOVER = "pushover"
+    TELEGRAM = "telegram"
+    EMAIL = "email"
+    DISCORD = "discord"
+    WEBHOOK = "webhook"
+    HOMEASSISTANT = "homeassistant"
+    BARK = "bark"
+
+
+class NotificationProviderBase(BaseModel):
+    """Base schema for notification providers."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="User-defined name")
+    provider_type: ProviderType = Field(..., description="Type of notification provider")
+    enabled: bool = Field(default=True, description="Whether notifications are enabled")
+    config: dict[str, Any] = Field(..., description="Provider-specific configuration")
+    attach_photo: bool = Field(
+        default=True, description="Attach a camera snapshot to this provider's notifications when one is available"
+    )
+
+    # Event triggers - print lifecycle
+    on_print_start: bool = Field(default=False, description="Notify on print start")
+    on_print_complete: bool = Field(default=True, description="Notify on print complete")
+    on_print_failed: bool = Field(default=True, description="Notify on print failed")
+    on_print_stopped: bool = Field(default=True, description="Notify when print is stopped/cancelled")
+    on_print_progress: bool = Field(default=False, description="Notify at 25%, 50%, 75% progress")
+    on_print_missing_spool_assignment: bool = Field(
+        default=False,
+        description="Notify when a print starts with required trays missing spool assignments",
+    )
+    on_billing_charge_failed: bool = Field(default=True, description="Notify when a print charge cannot be recorded")
+
+    # Event triggers - printer status
+    on_printer_offline: bool = Field(default=False, description="Notify when printer goes offline")
+    on_printer_error: bool = Field(default=False, description="Notify on printer errors (AMS, etc.)")
+    on_ai_failure_detection: bool = Field(
+        default=False,
+        description="Notify when Obico AI detects a possible print failure (spaghetti)",
+    )
+    on_filament_low: bool = Field(default=False, description="Notify when filament is running low")
+    on_maintenance_due: bool = Field(default=False, description="Notify when maintenance is due")
+
+    # Event triggers - AMS environmental alarms (regular AMS)
+    on_ams_humidity_high: bool = Field(default=False, description="Notify when AMS humidity exceeds threshold")
+    on_ams_temperature_high: bool = Field(default=False, description="Notify when AMS temperature exceeds threshold")
+    on_ams_drying_suspended: bool = Field(
+        default=True, description="Notify when automatic drying gives up on an AMS unit"
+    )
+
+    # Event triggers - AMS-HT environmental alarms
+    on_ams_ht_humidity_high: bool = Field(default=False, description="Notify when AMS-HT humidity exceeds threshold")
+    on_ams_ht_temperature_high: bool = Field(
+        default=False, description="Notify when AMS-HT temperature exceeds threshold"
+    )
+
+    # Event triggers - Home Assistant sensors bound to a printer (#1148)
+    on_ha_sensor_alert: bool = Field(
+        default=False, description="Notify when a bound Home Assistant sensor enters its alert state"
+    )
+
+    # Event triggers - Home Assistant sensors bound to a storage location (#2824)
+    on_location_ha_sensor_alert: bool = Field(
+        default=False,
+        description="Notify when a Home Assistant sensor bound to a storage location enters its alert state",
+    )
+
+    # Event triggers - Build plate detection
+    on_plate_not_empty: bool = Field(default=True, description="Notify when objects detected on plate before print")
+    on_plate_clear_required: bool = Field(
+        default=False, description="Notify when a finished print is waiting for plate-clear confirmation"
+    )
+
+    # Event triggers - Post-print outcome confirmation (#1898)
+    on_print_confirm_request: bool = Field(
+        default=True,
+        description="Notify with one-tap verdict links when a print that opted in asks for its outcome",
+    )
+    # How a Telegram provider collects the verdict (#3046). Ignored elsewhere.
+    telegram_verdict_mode: Literal["buttons", "reactions", "both"] = Field(
+        default="buttons",
+        description="Telegram only: answer the outcome prompt via inline buttons, a thumbs reaction, or both",
+    )
+
+    # Event triggers - Bed cooled
+    on_bed_cooled: bool = Field(default=False, description="Notify when bed cools after print")
+
+    # Event triggers - First layer complete
+    on_first_layer_complete: bool = Field(default=False, description="Notify when first layer completes")
+
+    # Messages from connected apps (POST /notifications/app-message)
+    on_app_message: bool = Field(default=False, description="Deliver messages other applications send")
+
+    # Event triggers - Inventory stock alerts
+    # Missing from this schema until now, so every payload naming them was
+    # dropped silently: the UI's toggles round-tripped as 200 OK and the row
+    # never changed, and _provider_to_dict never returned them either, so they
+    # always read back off. The columns and the sending code have existed since
+    # the inventory forecast landed.
+    on_stock_reorder_alert: bool = Field(
+        default=False, description="Notify when an inventory SKU hits its reorder point"
+    )
+    on_stock_break_alert: bool = Field(
+        default=False, description="Notify when stock will run out before replenishment arrives"
+    )
+
+    # Event triggers - Print queue
+    on_queue_job_added: bool = Field(default=False, description="Notify when job is added to queue")
+    on_queue_job_assigned: bool = Field(default=False, description="Notify when model-based job is assigned to printer")
+    on_queue_job_started: bool = Field(default=False, description="Notify when queue job starts printing")
+    on_queue_job_waiting: bool = Field(default=True, description="Notify when job is waiting for filament or printer")
+    on_queue_job_skipped: bool = Field(default=True, description="Notify when job is skipped")
+    on_queue_job_failed: bool = Field(default=True, description="Notify when job fails to start")
+    on_queue_completed: bool = Field(default=False, description="Notify when all queue jobs finish")
+
+    # Quiet hours
+    quiet_hours_enabled: bool = Field(default=False, description="Enable quiet hours")
+    quiet_hours_start: str | None = Field(default=None, description="Start time in HH:MM format")
+    quiet_hours_end: str | None = Field(default=None, description="End time in HH:MM format")
+
+    # Daily digest
+    daily_digest_enabled: bool = Field(default=False, description="Batch notifications into daily digest")
+    daily_digest_time: str | None = Field(default=None, description="Time to send digest in HH:MM format")
+
+    # Printer filter
+    printer_id: int | None = Field(default=None, description="Specific printer ID or null for all")
+
+    @field_validator("quiet_hours_start", "quiet_hours_end", "daily_digest_time")
+    @classmethod
+    def validate_time_format(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            parts = v.split(":")
+            if len(parts) != 2:
+                raise ValueError("Invalid time format")
+            hour, minute = int(parts[0]), int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Invalid time range")
+            return f"{hour:02d}:{minute:02d}"
+        except (ValueError, TypeError):
+            raise ValueError("Time must be in HH:MM format (e.g., 22:00)")
+
+
+class NotificationProviderCreate(NotificationProviderBase):
+    """Schema for creating a notification provider."""
+
+    pass
+
+
+class NotificationProviderUpdate(BaseModel):
+    """Schema for updating a notification provider (all fields optional)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    provider_type: ProviderType | None = None
+    enabled: bool | None = None
+    config: dict[str, Any] | None = None
+    attach_photo: bool | None = None
+
+    # Event triggers - print lifecycle
+    on_print_start: bool | None = None
+    on_print_complete: bool | None = None
+    on_print_failed: bool | None = None
+    on_print_stopped: bool | None = None
+    on_print_progress: bool | None = None
+    on_print_missing_spool_assignment: bool | None = None
+    on_billing_charge_failed: bool | None = None
+
+    # Event triggers - printer status
+    on_printer_offline: bool | None = None
+    on_printer_error: bool | None = None
+    on_ai_failure_detection: bool | None = None
+    on_filament_low: bool | None = None
+    on_maintenance_due: bool | None = None
+
+    # Event triggers - AMS environmental alarms (regular AMS)
+    on_ams_humidity_high: bool | None = None
+    on_ams_temperature_high: bool | None = None
+    on_ams_drying_suspended: bool | None = None
+
+    # Event triggers - AMS-HT environmental alarms
+    on_ams_ht_humidity_high: bool | None = None
+    on_ams_ht_temperature_high: bool | None = None
+
+    # Event triggers - Home Assistant sensors bound to a printer (#1148)
+    on_ha_sensor_alert: bool | None = None
+
+    # Event triggers - Home Assistant sensors bound to a storage location (#2824)
+    on_location_ha_sensor_alert: bool | None = None
+
+    # Event triggers - Build plate detection
+    on_plate_not_empty: bool | None = None
+    on_plate_clear_required: bool | None = None
+
+    # Event triggers - Post-print outcome confirmation (#1898)
+    on_print_confirm_request: bool | None = None
+    telegram_verdict_mode: Literal["buttons", "reactions", "both"] | None = None
+
+    # Event triggers - Bed cooled
+    on_bed_cooled: bool | None = None
+
+    # Event triggers - First layer complete
+    on_first_layer_complete: bool | None = None
+
+    # Messages from connected apps
+    on_app_message: bool | None = None
+
+    # Event triggers - Inventory stock alerts
+    on_stock_reorder_alert: bool | None = None
+    on_stock_break_alert: bool | None = None
+
+    # Event triggers - Print queue
+    on_queue_job_added: bool | None = None
+    on_queue_job_assigned: bool | None = None
+    on_queue_job_started: bool | None = None
+    on_queue_job_waiting: bool | None = None
+    on_queue_job_skipped: bool | None = None
+    on_queue_job_failed: bool | None = None
+    on_queue_completed: bool | None = None
+
+    # Quiet hours
+    quiet_hours_enabled: bool | None = None
+    quiet_hours_start: str | None = None
+    quiet_hours_end: str | None = None
+
+    # Daily digest
+    daily_digest_enabled: bool | None = None
+    daily_digest_time: str | None = None
+
+    # Printer filter
+    printer_id: int | None = None
+
+
+class NotificationProviderResponse(NotificationProviderBase):
+    """Schema for notification provider API responses."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_event_flags_read_as_off(cls, data: Any) -> Any:
+        """Read a NULL event flag as off instead of failing the whole response.
+
+        Every on_* column on notification_providers is nullable with no server
+        default -- the values come from the ORM at INSERT time. A row created
+        before a flag's column existed keeps NULL there forever unless a
+        migration backfills it, and one that did not (the column was created by
+        Base.metadata before run_migrations, so the ALTER ... DEFAULT false was
+        swallowed as a duplicate) leaves NULLs behind on a live install.
+
+        Those NULLs are harmless until the flag is declared on this schema: the
+        Response inherits the write model, so `bool` is then required on the way
+        out, pydantic rejects None, and every provider row fails at once -- the
+        list route 500s and the UI renders an empty list, which reads to the user
+        as "my providers are gone". That is exactly what shipped in #2827.
+
+        Off is not a guess: _get_providers_for_event selects on `.is_(True)`, so
+        the sender already skips a NULL flag. This makes the read agree with the
+        behaviour the row already has, rather than with the field's declared
+        default -- some of which are True, and none of which should switch a
+        notification on as a side effect of repairing a legacy row.
+
+        Writes are untouched: Create and Update inherit from the base, not here,
+        so a payload sending null for a flag is still a 422.
+        """
+        # Every route returns _provider_to_dict(); anything else (an ORM object
+        # via from_attributes) is passed through for pydantic to handle.
+        if not isinstance(data, dict):
+            return data
+        flags = [name for name, f in cls.model_fields.items() if f.annotation is bool]
+        if any(data.get(name, False) is None for name in flags):
+            data = {**data, **{name: False for name in flags if data.get(name, False) is None}}
+        return data
+
+    id: int
+    last_success: datetime | None = None
+    last_error: str | None = None
+    last_error_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AppMessage(BaseModel):
+    """A message another application sends through Bambuddy's notification channels."""
+
+    title: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=2000)
+    url: str | None = Field(default=None, max_length=500, description="A link the message points to (http or https)")
+
+    @field_validator("title", "message")
+    @classmethod
+    def _plain_text(cls, value: str) -> str:
+        # Plain text: no control characters beyond line breaks and tabs.
+        cleaned = "".join(ch for ch in value if ch in "\n\t" or ch.isprintable()).strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, value: str | None) -> str | None:
+        if value is None or value.strip() == "":
+            return None
+        value = value.strip()
+        if not value.lower().startswith(("http://", "https://")) or any(c.isspace() for c in value):
+            raise ValueError("must be an http or https address")
+        return value
+
+
+class AppMessageResult(BaseModel):
+    channels: int = Field(description="How many channels the message was handed to")
+
+
+class AppMessageChannel(BaseModel):
+    name: str
+    provider_type: str
+
+
+class NotificationTestRequest(BaseModel):
+    """Schema for testing notification configuration."""
+
+    provider_type: ProviderType
+    config: dict[str, Any]
+    attach_photo: bool = Field(
+        default=True, description="Include a sample photo in the test, mirroring the provider's own toggle"
+    )
+
+
+class NotificationTestResponse(BaseModel):
+    """Schema for test notification response."""
+
+    success: bool
+    message: str
+
+
+# Provider-specific config schemas for documentation/validation reference
+class CallMeBotConfig(BaseModel):
+    """CallMeBot/WhatsApp configuration."""
+
+    phone: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
+    apikey: str = Field(..., description="API key from CallMeBot")
+
+
+class NtfyConfig(BaseModel):
+    """ntfy configuration."""
+
+    server: str = Field(default="https://ntfy.sh", description="ntfy server URL")
+    topic: str = Field(..., description="Topic name to publish to")
+    auth_token: str | None = Field(default=None, description="Optional authentication token")
+    event_priorities: dict[str, int] | None = Field(
+        default=None,
+        description=(
+            "Per-event priority override. Keys are event names, either the provider's "
+            "toggle column ('on_print_failed', what the UI writes) or the bare event "
+            "name ('print_failed'); both are accepted. Values are ntfy priorities 1-5 "
+            "(1=min, 2=low, 3=default, 4=high, 5=urgent). Events without an entry use "
+            "ntfy's server-side default."
+        ),
+    )
+
+
+class PushoverConfig(BaseModel):
+    """Pushover configuration."""
+
+    user_key: str = Field(..., description="Your Pushover user key")
+    app_token: str = Field(..., description="Your Pushover application token")
+    priority: int = Field(default=0, ge=-2, le=2, description="Message priority (-2 to 2)")
+    # Emergency priority (2) only: how often to re-alert and when to stop.
+    # Pushover requires retry >= 30s and expire <= 10800s (3h).
+    retry: int = Field(default=60, ge=30, le=10800, description="Emergency re-alert interval in seconds (priority 2)")
+    expire: int = Field(default=3600, ge=30, le=10800, description="Emergency alert expiry in seconds (priority 2)")
+
+
+class TelegramConfig(BaseModel):
+    """Telegram bot configuration."""
+
+    bot_token: str = Field(..., description="Bot token from @BotFather")
+    chat_id: str = Field(..., description="Chat ID to send messages to")
+
+
+class EmailConfig(BaseModel):
+    """Email/SMTP configuration."""
+
+    smtp_server: str = Field(..., description="SMTP server hostname")
+    smtp_port: int = Field(default=587, description="SMTP port (587 for TLS, 465 for SSL)")
+    username: str = Field(..., description="SMTP username/email")
+    password: str = Field(..., description="SMTP password or app password")
+    from_email: str = Field(..., description="From email address")
+    to_email: str = Field(..., description="Recipient email address")
+    use_tls: bool = Field(default=True, description="Use TLS encryption")
+
+
+# Notification Log schemas
+class NotificationLogResponse(BaseModel):
+    """Schema for notification log API responses."""
+
+    id: int
+    provider_id: int
+    provider_name: str | None = None
+    provider_type: str | None = None
+    event_type: str
+    title: str
+    message: str
+    success: bool
+    error_message: str | None = None
+    printer_id: int | None = None
+    printer_name: str | None = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationLogStats(BaseModel):
+    """Statistics for notification logs."""
+
+    total: int
+    success_count: int
+    failure_count: int
+    by_event_type: dict[str, int]
+    by_provider: dict[str, int]

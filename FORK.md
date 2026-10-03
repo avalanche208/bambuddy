@@ -1,0 +1,11 @@
+# Fork maintenance
+
+Upstream baseline: maziggy/bambuddy v1.2.5.7, ecddbf2b9294d0118f9d7e2d995b23f07d76b458.
+
+Preserve the original complete application, UI, authentication, database, features and paths. The sole functional customization removes the persistent Developer LAN Mode warning banner and its polling query from frontend/src/components/Layout.tsx. Update its layout regression test accordingly. Diagnostic tools and actual printer limitations remain unchanged.
+
+Docker Compose points at avalanche208/bambuddy. The fork publishing workflow tests the layout and builds the original Dockerfile for amd64/arm64, then publishes latest and the application version. Increment APP_VERSION in backend/app/core/config.py for each fork publication.
+
+The discarded monitoring-only rewrite must not be reintroduced. Its monitor.db is separate from upstream bambuddy.db; no existing database is deleted or overwritten by this restoration. Data entered only in that discarded interface is not automatically imported.
+
+Weekly release maintenance preserves these small changes while merging official stable releases, validates before promotion, and checks publishing success.
