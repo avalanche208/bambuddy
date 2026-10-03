@@ -1,6 +1,6 @@
 # Bambuddy Monitor
 
-A monitoring-only fork of [maziggy/bambuddy](https://github.com/maziggy/bambuddy), for printer status and filament inventory. Version **2026.10.3-1a**.
+A monitoring-only fork of [maziggy/bambuddy](https://github.com/maziggy/bambuddy), for printer status and filament inventory. Version **2026.10.3-1b**.
 
 **Developer Mode is not required.** Printers can stay connected to Bambu Cloud while this application reads their local MQTT telemetry. Network and firmware must permit local status access. Nothing in this app starts, pauses, stops, moves, heats, loads, unloads, configures or updates a printer.
 
@@ -35,12 +35,15 @@ cp .env.example .env
 # Edit .env and choose BAMBUDDY_PASSWORD.
 mkdir -p data
 sudo chown 1000:1000 data
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+To build locally instead, run `docker compose up -d --build`.
 
 Open `http://SERVER-IP:8000`; sign in as `admin` with the password from `.env`. Add each printer using its local IP, serial number and access code. No Bambu account password is requested.
 
-For unRAID: build this Dockerfile, map container port 8000, map `/data` to a **new** appdata directory writable by UID 1000, and set `BAMBUDDY_PASSWORD`. Change `BAMBUDDY_USERNAME` if desired. The host must reach each printer on TCP 8883; cameras additionally use 322 or 6000. Manual IP setup works with bridge networking; host networking and printer discovery are not required. No registry image has been published by this source-only workflow.
+For unRAID: use `avalanche208/bambuddy:latest`, map container port 8000, map `/data` to a **new** appdata directory writable by UID 1000, and set `BAMBUDDY_PASSWORD`. Change `BAMBUDDY_USERNAME` if desired. The host must reach each printer on TCP 8883; cameras additionally use 322 or 6000. Manual IP setup works with bridge networking; host networking and printer discovery are not required. After validation, pushes to `main` publish `latest` and the application version tag to Docker Hub for amd64 and arm64. This uses the repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` (a Docker Hub access token).
 
 For access beyond a trusted LAN, use your HTTPS reverse proxy. HTTP Basic authentication requires HTTPS to protect the browser-to-server credentials. When using a proxy, preserve the original Host and scheme and configure Uvicorn's trusted proxy IPs appropriately. Printer TLS behavior is inherited from upstream and accepts the printers' self-signed certificates.
 
@@ -63,7 +66,9 @@ python -m pytest -q
 node --check monitor/static/app.js
 ```
 
-The CI workflow also builds the Dockerfile. No workflow merges upstream automatically: upstream changes must be reviewed so control functionality cannot return unnoticed.
+The CI workflow also builds the Dockerfile. The **Review upstream updates** workflow checks upstream every Sunday at 08:00 UTC and can also be run manually from GitHub Actions. It opens or updates a draft PR with compatible changes to the retained telemetry/camera code, per-file three-way merge results, and a report of other upstream features worth porting. Candidate changes that fail the read-only tests are reverted before the draft PR is created. Conflicts are supplied as review patches, never applied to the running app. Nothing merges or deploys automatically.
+
+See [upstream maintenance](docs/upstream-maintenance.md) for the review process and local commands.
 
 ## Provenance and license
 

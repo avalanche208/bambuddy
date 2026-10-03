@@ -1,7 +1,7 @@
 services:
   bambuddy-monitor:
     build: .
-    image: bambuddy-monitor:local
+    image: avalanche208/bambuddy:latest
     container_name: bambuddy-monitor
     ports:
       - "8000:8000"

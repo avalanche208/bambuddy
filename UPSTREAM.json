@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/maziggy/bambuddy",
+  "reviewed_commit": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+  "files": {
+    "backend/app/core/logging_filters.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/data/hms_catalog.json": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/services/bambu_mqtt.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/services/camera.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/services/hms_errors.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/utils/ams_drying.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/utils/ams_humidity.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/utils/ffmpeg_output.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/utils/paho_teardown.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458",
+    "backend/app/utils/printer_models.py": "ecddbf2b9294d0118f9d7e2d995b23f07d76b458"
+  }
+}
