@@ -7,7 +7,7 @@ services:
       - "8000:8000"
     environment:
       BAMBUDDY_USERNAME: ${BAMBUDDY_USERNAME:-admin}
-      BAMBUDDY_PASSWORD: ${BAMBUDDY_PASSWORD:?Set BAMBUDDY_PASSWORD in .env}
+      BAMBUDDY_PASSWORD: ${BAMBUDDY_PASSWORD:-}
       TZ: America/Chicago
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}

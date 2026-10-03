@@ -26,7 +26,7 @@ from monitor import __version__
 from monitor.store import Store
 
 log = logging.getLogger(__name__)
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 STATIC = Path(__file__).parent / 'static'
 
 
@@ -144,10 +144,10 @@ def create_app(data_dir=None, password=None, connect_printers=True):
     store = Store(data_dir or os.environ.get('DATA_DIR', './data'))
     monitor = Monitor(store)
 
-    async def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+    async def authenticate(credentials: HTTPBasicCredentials | None = Depends(security)):
         if not password:
-            raise HTTPException(503, 'Set BAMBUDDY_PASSWORD before using the application')
-        if not (secrets.compare_digest(credentials.username.encode(), username.encode()) & secrets.compare_digest(credentials.password.encode(), password.encode())):
+            return
+        if credentials is None or not (secrets.compare_digest(credentials.username.encode(), username.encode()) & secrets.compare_digest(credentials.password.encode(), password.encode())):
             raise HTTPException(401, 'Incorrect username or password', headers={'WWW-Authenticate':'Basic'})
 
     async def watchdog():
@@ -158,8 +158,6 @@ def create_app(data_dir=None, password=None, connect_printers=True):
 
     @asynccontextmanager
     async def lifespan(app):
-        if not password:
-            raise RuntimeError('BAMBUDDY_PASSWORD must be set')
         if connect_printers:
             for row in store.rows('SELECT * FROM printers'):
                 monitor.connect(row)

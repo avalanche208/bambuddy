@@ -203,3 +203,13 @@ def test_camera_failure_is_explained_without_mode_requirement(web,monkeypatch):
     response=client.get('/api/printers/1/camera')
     assert response.status_code==503
     assert 'not required' in response.json()['detail']
+
+
+def test_startup_without_password(tmp_path, monkeypatch):
+    monkeypatch.delenv('BAMBUDDY_PASSWORD', raising=False)
+    app = create_app(tmp_path, connect_printers=False)
+    with TestClient(app) as client:
+        assert client.get('/health').status_code == 200
+        assert client.get('/').status_code == 200
+        assert client.get('/api/printers').json() == []
+        assert client.post('/api/spools', json=spool_payload()).status_code == 201

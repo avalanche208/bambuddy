@@ -25,10 +25,7 @@
 set -eu
 
 echo "[entrypoint] Starting Bambuddy Monitor"
-if [ -z "${BAMBUDDY_PASSWORD:-}" ]; then
-    echo "[entrypoint] ERROR: Set the BAMBUDDY_PASSWORD container environment variable to your login password." >&2
-    exit 1
-fi
+
 
 # Default to 1000:1000 to match the legacy `user: "1000:1000"` default
 # in our previously-shipped compose template; overridable via env so
