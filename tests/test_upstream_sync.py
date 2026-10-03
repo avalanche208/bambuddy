@@ -72,3 +72,11 @@ def test_same_upstream_is_noop(repository,monkeypatch):
     def unexpected(repo):raise AssertionError('No validation needed for unchanged upstream')
     monkeypatch.setattr(sync,'validate_candidate',unexpected)
     assert sync.prepare_updates(repo,base) is False
+
+
+def test_multiple_conflicts_are_reviewable_not_fatal():
+    context = "".join(f"# unchanged {i}\n" for i in range(12))
+    base = "value = 1\n" + context + "other = 1\n"
+    ours = "value = 2\n" + context + "other = 2\n"
+    theirs = "value = 3\n" + context + "other = 3\n"
+    assert sync.merge_versions(ours, base, theirs) is None

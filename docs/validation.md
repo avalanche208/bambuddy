@@ -12,6 +12,6 @@
 
 ## Not verified here
 
-No physical printers, model-specific firmware versions or real credentials were supplied. Synthetic model-name tests do not certify each firmware's payload or camera. No actual print, heater, motion, AMS control or firmware update was performed. Docker is unavailable in this workspace. The first published GitHub Actions run passed all 33 tests and the Docker build: https://github.com/avalanche208/bambuddy/actions/runs/37094704641. The next version adds five upstream-maintenance tests and a gated Docker Hub publishing job.
+No physical printers, model-specific firmware versions or real credentials were supplied. Synthetic model-name tests do not certify each firmware's payload or camera. No actual print, heater, motion, AMS control or firmware update was performed. Docker is unavailable in this workspace. The first published GitHub Actions run passed all 33 tests and the Docker build: https://github.com/avalanche208/bambuddy/actions/runs/37094704641. The next version adds six upstream-maintenance tests and a gated Docker Hub publishing job.
 
 This fork uses a new `monitor.db`, not upstream's database schema. No upstream data migration is implemented. Inventory gram balances are manually maintained; printer telemetry percentages do not silently overwrite them.

@@ -22,7 +22,7 @@ def merge_versions(ours, base, theirs):
         result = subprocess.run(['git', 'merge-file', '-p', *map(str, files)], capture_output=True, text=True)
         if result.returncode == 0:
             return result.stdout
-        if result.returncode == 1:
+        if 1 <= result.returncode <= 127:
             return None
         raise RuntimeError(result.stderr or 'Three-way merge failed')
 
