@@ -31,7 +31,7 @@ export function PrinterCardPreview({ printerId, printerName, connected, canViewC
       {canViewCamera && (
         <button type="button" onClick={toggle} aria-pressed={showLive}
           aria-label={showLive ? 'Show print preview' : 'Show live webcam'}
-          className="absolute bottom-1 left-1 right-1 z-10 rounded bg-black/80 px-1 py-1 text-[10px] font-medium text-white hover:bg-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-bambu-green">
+          className="absolute bottom-1 left-1 right-1 z-10 rounded bg-black/80 px-1 py-1 text-[10px] font-medium text-[#fff] hover:bg-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-bambu-green">
           {showLive ? 'Print preview' : 'Live webcam'}
         </button>
       )}
