@@ -5302,42 +5302,9 @@ class BambuMQTTClient:
                 self.state.developer_mode = (fun_int & 0x20000000) == 0
             except (ValueError, TypeError):
                 pass
-        elif self.state.developer_mode is None and not self._dev_mode_probed:
-            # No "fun" field — A1/P1 series never send it, so we need to probe.
-            # Two gates: (1) wait for a full pushall (30+ keys) so we don't probe
-            # before a pushall that might contain "fun" arrives, and (2) delay 5s
-            # after connect to let the MQTT session stabilize — probing too early
-            # can destabilize some firmware MQTT brokers (#887).
-            if not self._dev_mode_needs_probe and len(data) > 30:
-                # First full status without "fun" — mark that probe is needed
-                self._dev_mode_needs_probe = True
-            if self._dev_mode_needs_probe and time.monotonic() - self._connect_time >= 5.0:
-                self._probe_developer_mode()
-            elif self._dev_mode_needs_probe:
-                logger.debug(
-                    "[%s] Deferring developer mode probe (%.1fs since connect, need 5s)",
-                    self.serial_number,
-                    time.monotonic() - self._connect_time,
-                )
-        elif self._dev_mode_probed and self._dev_mode_probe_seq is not None:
-            # Probe was sent but no response yet — check for timeout.
-            # A half-broken MQTT session (e.g. after keep-alive timeout reconnect)
-            # may deliver status pushes but silently drop commands (#887).
-            elapsed = time.monotonic() - self._dev_mode_probe_time
-            if elapsed > 10.0:
-                self._dev_mode_probe_failures += 1
-                logger.warning(
-                    "[%s] Developer mode probe timed out after %.0fs (attempt %d)",
-                    self.serial_number,
-                    elapsed,
-                    self._dev_mode_probe_failures,
-                )
-                self._dev_mode_probe_seq = None
-                if self._dev_mode_probe_failures >= 2:
-                    self.force_reconnect_stale_session("developer mode probe unanswered 2×")
-                else:
-                    # Allow retry on next full status message
-                    self._dev_mode_probed = False
+        # This fork uses passive telemetry only for Developer Mode detection.
+        # Do not send a filament-setting command to test authorization: printers
+        # without Developer Mode can latch an HMS fault merely from that probe.
 
         # Zombie session detection: if an ams_filament_setting command has been
         # pending for >10s with no response, the publish path is likely dead (#887).
@@ -5638,51 +5605,12 @@ class BambuMQTTClient:
             self._client.publish(self.topic_publish, json.dumps(message), qos=1)
 
     def _probe_developer_mode(self):
-        """Probe developer mode by sending an ams_filament_setting for the external slot.
+        """Disabled: an authorization probe must not write printer settings.
 
-        Some printers (A1/P1 series) never send the "fun" field in MQTT status.
-        For these, we detect developer mode by sending a harmless command and
-        checking whether the printer accepts or rejects it:
-        - result="success" → developer mode ON (commands accepted)
-        - result="failed", reason="mqtt message verify failed" → developer mode OFF
-
-        The probe re-sends the current external slot configuration so it's a no-op
-        when the command succeeds. If there's no external slot data yet, we send a
-        reset (empty filament) which is also safe.
+        Keep this hook inert for callers; mode is read from telemetry/HMS only.
+        Missing telemetry leaves the mode unknown, without sending a command.
         """
-        if not self._client or not self.state.connected:
-            return
-        self._dev_mode_probed = True
-        self._dev_mode_probe_time = time.monotonic()
-        self._sequence_id += 1
-        seq = str(self._sequence_id)
-        self._dev_mode_probe_seq = seq
-
-        # Build probe command: re-send current external slot config (no-op on success)
-        vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
-        current = vt_tray[0] if vt_tray else {}
-
-        command = {
-            "print": {
-                "command": "ams_filament_setting",
-                "ams_id": 255,
-                "tray_id": 0,
-                "slot_id": 0,
-                "tray_info_idx": current.get("tray_info_idx", ""),
-                "tray_type": current.get("tray_type", ""),
-                "tray_sub_brands": current.get("tray_sub_brands", ""),
-                "tray_color": current.get("tray_color", "00000000"),
-                "nozzle_temp_min": current.get("nozzle_temp_min", 0),
-                "nozzle_temp_max": current.get("nozzle_temp_max", 0),
-                "sequence_id": seq,
-            }
-        }
-        setting_id = current.get("setting_id")
-        if setting_id:
-            command["print"]["setting_id"] = setting_id
-
-        logger.info("[%s] Probing developer mode via ams_filament_setting (seq=%s)", self.serial_number, seq)
-        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        return
 
     def _apply_mqtt_verify_state(self, verify_failed: bool) -> None:
         """Reconcile developer_mode with the printer's own command-verification verdict.

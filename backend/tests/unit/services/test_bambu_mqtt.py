@@ -3789,95 +3789,35 @@ class TestDeveloperModeProbeTimeout:
         client._connect_time = time.monotonic() - 10.0
         return client
 
+    def test_no_probe_on_full_or_incremental_status(self, mqtt_client):
+        for age in (1, 6, 60, 600):
+            mqtt_client._connect_time = time.monotonic() - age
+            mqtt_client._update_state(self._make_pushall_data())
+            mqtt_client._update_state({"gcode_state": "IDLE"})
+        mqtt_client._client.publish.assert_not_called()
+        assert mqtt_client.state.developer_mode is None
+        assert mqtt_client._dev_mode_probe_seq is None
+        assert mqtt_client.state.connected is True
+
+    def test_probe_hook_cannot_publish(self, mqtt_client):
+        mqtt_client._probe_developer_mode()
+        mqtt_client._client.publish.assert_not_called()
+
+    def test_connect_and_reconnect_only_publish_queries(self, mqtt_client):
+        mqtt_client._client.subscribe.return_value = (0, 1)
+        for _ in range(2):
+            mqtt_client._on_connect(mqtt_client._client, None, {}, 0)
+            mqtt_client._update_state(self._make_pushall_data())
+        commands = [next(iter(json.loads(call.args[1]).values()))['command']
+                    for call in mqtt_client._client.publish.call_args_list]
+        assert commands == ['pushall', 'get_version', 'extrusion_cali_get'] * 2
+
     def _make_pushall_data(self):
         """Create a print data dict with >30 keys (triggers probe) and no 'fun' field."""
         return {f"key_{i}": i for i in range(35)}
 
-    def test_first_timeout_allows_retry(self, mqtt_client):
-        """After first probe timeout, _dev_mode_probed resets to allow retry."""
-        import time
 
-        data = self._make_pushall_data()
 
-        # First pushall triggers the probe
-        mqtt_client._update_state(data)
-        assert mqtt_client._dev_mode_probed is True
-        assert mqtt_client._dev_mode_probe_seq is not None
-        assert mqtt_client.state.developer_mode is None
-
-        # Simulate 11 seconds passing
-        mqtt_client._dev_mode_probe_time = time.monotonic() - 11.0
-
-        # Next status message detects the timeout
-        mqtt_client._update_state(data)
-        assert mqtt_client._dev_mode_probe_failures == 1
-        assert mqtt_client._dev_mode_probe_seq is None
-        # Should allow retry on next full message
-        assert mqtt_client._dev_mode_probed is False
-        # Connection should NOT be force-closed after 1 failure
-        assert mqtt_client.state.connected is True
-
-    def test_second_timeout_forces_reconnect(self, mqtt_client):
-        """After two consecutive probe timeouts, force-close the socket.
-
-        Probe timeout detection runs from paho's network thread (no asyncio
-        loop), so force_reconnect_stale_session routes through socket-close
-        rather than hard-reset (loop_stop from inside the loop deadlocks)."""
-        import time
-
-        data = self._make_pushall_data()
-        state_change_called = []
-        mqtt_client.on_state_change = lambda s: state_change_called.append(True)
-
-        # First probe + timeout
-        mqtt_client._update_state(data)
-        mqtt_client._dev_mode_probe_time = time.monotonic() - 11.0
-        mqtt_client._update_state(data)
-        assert mqtt_client._dev_mode_probe_failures == 1
-
-        # Second probe (retry) + timeout
-        mqtt_client._update_state(data)  # triggers new probe
-        assert mqtt_client._dev_mode_probed is True
-        mqtt_client._dev_mode_probe_time = time.monotonic() - 11.0
-        mqtt_client._update_state(data)  # detects second timeout
-
-        assert mqtt_client._dev_mode_probe_failures == 2
-        assert mqtt_client.state.connected is False
-        assert mqtt_client._stale_reconnecting is True
-        # Sync test → no running loop → socket-close fallback path
-        mqtt_client._client.socket().close.assert_called()
-        assert len(state_change_called) > 0
-
-    def test_successful_probe_resets_failure_counter(self, mqtt_client):
-        """A probe response after a previous failure resets the counter."""
-        import time
-
-        data = self._make_pushall_data()
-
-        # First probe + timeout → failure=1
-        mqtt_client._update_state(data)
-        seq = mqtt_client._dev_mode_probe_seq
-        mqtt_client._dev_mode_probe_time = time.monotonic() - 11.0
-        mqtt_client._update_state(data)
-        assert mqtt_client._dev_mode_probe_failures == 1
-
-        # Retry probe
-        mqtt_client._update_state(data)
-        new_seq = mqtt_client._dev_mode_probe_seq
-        assert new_seq is not None
-        assert new_seq != seq
-
-        # Simulate successful response
-        mqtt_client._handle_dev_mode_probe_response(
-            {
-                "command": "ams_filament_setting",
-                "sequence_id": new_seq,
-                "result": "success",
-            }
-        )
-        assert mqtt_client._dev_mode_probe_failures == 0
-        assert mqtt_client.state.developer_mode is True
-        assert mqtt_client._dev_mode_probe_seq is None
 
     def test_no_timeout_when_probe_not_sent(self, mqtt_client):
         """The timeout branch is only entered when a probe is pending."""
@@ -3908,54 +3848,8 @@ class TestDeveloperModeProbeTimeout:
         assert mqtt_client._dev_mode_probe_failures == 0
         assert mqtt_client._connect_time > 0
 
-    def test_probe_deferred_when_connect_too_recent(self, mqtt_client):
-        """Probe is deferred if less than 5s have passed since _on_connect."""
-        import time
 
-        data = self._make_pushall_data()
 
-        # Set connect time to 1 second ago — too recent for probe
-        mqtt_client._connect_time = time.monotonic() - 1.0
-
-        mqtt_client._update_state(data)
-        # Pushall seen, so needs_probe is set, but probe NOT fired yet
-        assert mqtt_client._dev_mode_needs_probe is True
-        assert mqtt_client._dev_mode_probed is False
-        assert mqtt_client._dev_mode_probe_seq is None
-
-    def test_probe_fires_after_delay(self, mqtt_client):
-        """Probe fires once 5s have passed since _on_connect."""
-        import time
-
-        data = self._make_pushall_data()
-
-        # Set connect time to 6 seconds ago — delay satisfied
-        mqtt_client._connect_time = time.monotonic() - 6.0
-
-        mqtt_client._update_state(data)
-        # Probe should have fired
-        assert mqtt_client._dev_mode_needs_probe is True
-        assert mqtt_client._dev_mode_probed is True
-        assert mqtt_client._dev_mode_probe_seq is not None
-
-    def test_probe_fires_on_incremental_after_delay(self, mqtt_client):
-        """After seeing a pushall within 5s, probe fires on later incremental message."""
-        import time
-
-        pushall_data = self._make_pushall_data()
-        incremental_data = {"gcode_state": "IDLE", "mc_percent": 0}  # < 30 keys
-
-        # Pushall arrives 1s after connect — too early for probe
-        mqtt_client._connect_time = time.monotonic() - 1.0
-        mqtt_client._update_state(pushall_data)
-        assert mqtt_client._dev_mode_needs_probe is True
-        assert mqtt_client._dev_mode_probed is False
-
-        # 5s later, an incremental update arrives — probe fires now
-        mqtt_client._connect_time = time.monotonic() - 6.0
-        mqtt_client._update_state(incremental_data)
-        assert mqtt_client._dev_mode_probed is True
-        assert mqtt_client._dev_mode_probe_seq is not None
 
     def test_no_reprobe_when_developer_mode_cached(self, mqtt_client):
         """Auto-reconnect preserves developer_mode, skipping reprobe."""
