@@ -1,8 +1,8 @@
 services:
-  bambuddy-monitor:
+  bambuddy:
     build: .
     image: avalanche208/bambuddy:latest
-    container_name: bambuddy-monitor
+    container_name: bambuddy
     ports:
       - "8000:8000"
     environment:
@@ -10,5 +10,10 @@ services:
       BAMBUDDY_PASSWORD: ${BAMBUDDY_PASSWORD:?Set BAMBUDDY_PASSWORD in .env}
       TZ: America/Chicago
     volumes:
-      - ./data:/data
+      - bambuddy_data:/app/data
+      - bambuddy_logs:/app/logs
     restart: unless-stopped
+
+volumes:
+  bambuddy_data:
+  bambuddy_logs:
