@@ -1,8 +1,8 @@
-Prevent additional unsolicited calibration requests after printer boot/reconnection when Developer Mode is disabled or unknown. The earlier MQTT connection fix missed application-level calibration priming and automatic restoration of saved K-profiles after power cycles.
+Fix status-handler test failures by treating missing Developer Mode information as unknown. Background calibration remains disabled unless the printer positively reports Developer Mode enabled.
 
-Guard background calibration priming, restoration/retries, AMS-change calibration selection, deferred SpoolBuddy configuration, and backup calibration queries. Manual controls and deliberate queued printing remain unchanged. Real HMS faults remain visible; this update does not clear printer faults. Calibration K-values may be unavailable until the printer reports them.
+Correct the update-version test import formatting. Docker publication now requires the full CI workflow to pass for the same commit, including all backend test shards and lint checks.
 
-Keep the original interface, enlarged live-preview toggle, authentication, database, /app/data and /app/logs unchanged.
+No interface, database, authentication, or deployment-path changes.
 
-Image: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1j (also latest).
-Rollback: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1i.
+Image: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1k (also latest).
+Rollback: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1j.

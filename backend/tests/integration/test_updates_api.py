@@ -940,7 +940,8 @@ class TestUpdatesAPI:
 
 class TestForkVersions:
     def test_fork_builds_are_stable_and_ordered(self):
-        from backend.app.api.routes.updates import parse_version, is_newer_version, GITHUB_REPO
+        from backend.app.api.routes.updates import GITHUB_REPO, is_newer_version, parse_version
+
         assert GITHUB_REPO == "avalanche208/bambuddy"
         older = "1.2.5.7-fork.2026.10.3.1g"
         newer = "1.2.5.7-fork.2026.10.3.1h"

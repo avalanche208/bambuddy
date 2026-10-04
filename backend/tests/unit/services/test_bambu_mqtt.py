@@ -3808,16 +3808,15 @@ class TestDeveloperModeProbeTimeout:
         for _ in range(2):
             mqtt_client._on_connect(mqtt_client._client, None, {}, 0)
             mqtt_client._update_state(self._make_pushall_data())
-        commands = [next(iter(json.loads(call.args[1]).values()))['command']
-                    for call in mqtt_client._client.publish.call_args_list]
-        assert commands == ['pushall', 'get_version'] * 2
+        commands = [
+            next(iter(json.loads(call.args[1]).values()))["command"]
+            for call in mqtt_client._client.publish.call_args_list
+        ]
+        assert commands == ["pushall", "get_version"] * 2
 
     def _make_pushall_data(self):
         """Create a print data dict with >30 keys (triggers probe) and no 'fun' field."""
         return {f"key_{i}": i for i in range(35)}
-
-
-
 
     def test_no_timeout_when_probe_not_sent(self, mqtt_client):
         """The timeout branch is only entered when a probe is pending."""
@@ -3847,9 +3846,6 @@ class TestDeveloperModeProbeTimeout:
         assert mqtt_client._dev_mode_probe_time == 0.0
         assert mqtt_client._dev_mode_probe_failures == 0
         assert mqtt_client._connect_time > 0
-
-
-
 
     def test_no_reprobe_when_developer_mode_cached(self, mqtt_client):
         """Auto-reconnect preserves developer_mode, skipping reprobe."""

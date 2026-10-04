@@ -1605,7 +1605,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         state.connected
         and state_known
         # Background calibration must never probe an unknown/locked printer.
-        and state.developer_mode is True
+        and getattr(state, "developer_mode", None) is True
         and nozzle_known
         and not _printer_kprofiles_primed_since_connect.get(printer_id, False)
     ):
@@ -2060,7 +2060,7 @@ async def on_fts_inlet_change(printer_id: int, ams_id: int, inlet: str):
 
     client = printer_manager.get_client(printer_id)
     state = printer_manager.get_status(printer_id)
-    if not client or not state or not state.raw_data or state.developer_mode is not True:
+    if not client or not state or not state.raw_data or getattr(state, "developer_mode", None) is not True:
         return
 
     # The nozzle the AMS now feeds -- the diameter of the TARGET extruder, not
@@ -2784,7 +2784,10 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                         # cali_idx differs from the stored value.
                                         # Avoids spamming the broker on every
                                         # MQTT push during steady-state operation.
-                                        if live_cali_idx != chosen_kp.cali_idx and state.developer_mode is True:
+                                        if (
+                                            live_cali_idx != chosen_kp.cali_idx
+                                            and getattr(state, "developer_mode", None) is True
+                                        ):
                                             client = printer_manager.get_client(printer_id)
                                             if client:
                                                 cali_filament_id = spool.slicer_filament or tray_info_idx or ""
@@ -6296,7 +6299,7 @@ async def prime_kprofile_table(printer_id: int) -> int:
     """
     client = printer_manager.get_client(printer_id)
     state = printer_manager.get_status(printer_id)
-    if client is None or state is None or not state.connected or state.developer_mode is not True:
+    if client is None or state is None or not state.connected or getattr(state, "developer_mode", None) is not True:
         return 0
 
     # Deduplicated, order preserved: a dual-nozzle printer with two 0.4s should

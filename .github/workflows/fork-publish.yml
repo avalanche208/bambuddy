@@ -34,9 +34,46 @@ jobs:
       - name: Verify fork update source and version ordering in image
         run: |
           docker run --rm --entrypoint python bambuddy:restore-test -c 'from backend.app.api.routes.updates import GITHUB_REPO, parse_version, is_newer_version; assert GITHUB_REPO == "avalanche208/bambuddy"; assert parse_version("1.2.5.7-fork.2026.10.3.1h")[4] == 0; assert is_newer_version("1.2.5.7-fork.2026.10.3.1h", "1.2.5.7-fork.2026.10.3.1g"); assert not is_newer_version("1.2.5.7-fork.2026.10.3.1g", "1.2.5.7-fork.2026.10.3.1h")'
+  full-ci:
+    name: Require full CI for this commit
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const deadline = Date.now() + 20 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo,
+                workflow_id: 'ci.yml',
+                head_sha: context.sha,
+                branch: context.ref.replace('refs/heads/', ''),
+                event: 'push',
+                per_page: 100,
+              });
+              const run = data.workflow_runs
+                .filter(r => r.head_sha === context.sha)
+                .sort((a, b) => b.id - a.id)[0];
+              if (run?.status === 'completed') {
+                if (run.conclusion !== 'success') {
+                  core.setFailed(`Full CI ${run.conclusion}: ${run.html_url}`);
+                } else {
+                  core.info(`Full CI passed: ${run.html_url}`);
+                }
+                return;
+              }
+              core.info(`Waiting for full CI on ${context.sha}`);
+              await new Promise(resolve => setTimeout(resolve, 15000));
+            }
+            core.setFailed('Timed out waiting for full CI; publication blocked.');
   publish:
     if: github.ref == 'refs/heads/main'
-    needs: validate
+    needs: [validate, full-ci]
     permissions:
       contents: write
     runs-on: ubuntu-latest
