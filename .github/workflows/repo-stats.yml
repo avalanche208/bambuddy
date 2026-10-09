@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   repo-stats:
+    # Upstream analytics use maziggy's token, Pages site, and GHCR package.
+    # Forks do not need this reporting job to build or update Bambuddy.
+    if: github.repository == 'maziggy/bambuddy'
     name: repo-stats
     runs-on: ubuntu-latest
     steps:
