@@ -1,8 +1,8 @@
-Fix status-handler test failures by treating missing Developer Mode information as unknown. Background calibration remains disabled unless the printer positively reports Developer Mode enabled.
+Update to official Bambuddy v1.3.0, released November 7, 2026. Includes multi-print archives, inventory improvements, camera updates, permission fixes and upstream database migrations.
 
-Correct the update-version test import formatting. Docker publication now requires the full CI workflow to pass for the same commit, including all backend test shards and lint checks.
+Preserve fork update checks, the remembered enlarged live preview, removed Developer LAN banner, and passive-only guards on background calibration. New finish-photo bed movements require positively reported Developer Mode. Manual controls and queued-print dispatch remain available. Docker paths and volumes are unchanged.
 
-No interface, database, authentication, or deployment-path changes.
+Read upstream upgrade notes before deployment: https://github.com/maziggy/bambuddy/releases/tag/v1.3.0
 
-Image: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1k (also latest).
-Rollback: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1j.
+Candidate image: avalanche208/bambuddy:1.3.0-fork.2026.11.8.1 (not published until validation succeeds).
+Previous image: avalanche208/bambuddy:1.2.5.7-fork.2026.10.3.1k. Preserve a pre-upgrade database backup for rollback across upstream database migrations.
