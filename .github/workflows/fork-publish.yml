@@ -1,7 +1,7 @@
 name: Build original Bambuddy fork
 on:
   push:
-    branches: [main, restore-original, preview-camera-update]
+    branches: [main, restore-original, preview-camera-update, review/upstream-v1.3.0]
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: pip install -r requirements.txt pytest pytest-asyncio
+      - run: pip install -r requirements.lock pytest pytest-asyncio
       - name: Verify MQTT parsing and background calibration guards
         run: PYTHONPATH=. python -m pytest -c /dev/null --noconftest backend/tests/unit/services/test_bambu_mqtt.py backend/tests/unit/services/test_kprofile_drift_3219.py backend/tests/unit/services/test_kprofile_nozzle_buckets_2854.py backend/tests/unit/test_fts_kprofile_routing.py backend/tests/unit/services/test_fork_background_backup.py -q
       - name: Verify inventory assignment and guarded deferred replay

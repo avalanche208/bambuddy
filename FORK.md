@@ -1,6 +1,8 @@
 # Fork maintenance
 
-Upstream baseline: maziggy/bambuddy v1.2.5.7, ecddbf2b9294d0118f9d7e2d995b23f07d76b458.
+Upstream baseline in this candidate: maziggy/bambuddy v1.3.0, 2f87192334f66bc4b27b84ba48c6a2d216dd8afc.
+
+Last published baseline remains v1.2.5.7 until this candidate passes validation and publication.
 
 Preserve the original complete application, UI, authentication, database, features and paths. The UI customization removes the persistent Developer LAN Mode warning banner and its polling query from frontend/src/components/Layout.tsx. Update its layout regression test accordingly. Diagnostic tools and actual printer limitations remain unchanged.
 
@@ -19,3 +21,5 @@ Release 1i: the MQTT connection callback sends only pushall and get_version; its
 Release 1j: require passively reported developer_mode is True before background calibration-table priming, idle/power-cycle K-profile restoration, AMS inlet/spool-change calibration selection, deferred SpoolBuddy slot configuration, and backup K-profile queries. Unknown and False both skip these commands. Recheck the idle restoration guard at execution time; deliberate queued-print dispatch remains unchanged. Preserve these guards on upstream sync. Do not hide actual HMS errors. Monitoring may lack K-values until supplied by printer reports. No UI, deployment-path, authentication, or database changes.
 
 Release 1k: treat a missing developer_mode attribute as unknown in all application-level calibration guards. Full CI must succeed for the exact commit and branch before the publishing workflow may push Docker tags. CI also runs on the review branches so validation can finish before promotion to main. Preserve this publication gate.
+
+Release candidate 1.3.0-fork.2026.11.8.1: preserve all fork restrictions while integrating stable upstream 1.3.0. Finish-photo plate restore and parking also require passive developer_mode is True immediately before movement. Preserve upstream active-slot deferred configuration protection and camera viewer session IDs.

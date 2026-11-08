@@ -26,7 +26,7 @@ describe('PrinterCardPreview', () => {
     expect(stored['printerCardLivePreview:42']).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: 'Show print preview' }));
     expect(screen.getByText('Model preview')).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledWith('/api/v1/printers/42/camera/stop', expect.any(Object));
+    expect(fetch).toHaveBeenCalledWith(expect.stringMatching(/^\/api\/v1\/printers\/42\/camera\/stop\?viewer=.+$/), expect.any(Object));
   });
   it('restores preferences for the specific printer', async () => {
     stored['printerCardLivePreview:42'] = 'true';
